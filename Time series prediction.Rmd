@@ -1,0 +1,324 @@
+---
+title: "Data Exploration"
+author: "Gianluca Scuri"
+date: "2022-12-11"
+output: html_document
+---
+
+# Time series forecast:
+
+## Setup and loading dataset
+
+```{r}
+set.seed(100)
+
+packages <- c("KFAS", "xts") # librerie
+
+installed_packages <- packages %in% rownames(installed.packages())
+if (any(installed_packages == FALSE)) {
+  install.packages(packages[!installed_packages])
+}
+
+# Packages loading
+invisible(lapply(packages, library, character.only = TRUE))
+```
+
+```{r}
+# MAPE 
+mape <- function(actual,pred){
+  mape <- mean(abs((actual - pred)/actual))*100
+  return (mape)
+}
+
+# MAE
+mae <- function(actual,pred){
+  mae <- mean(abs(actual - pred))
+  return (mae)
+}
+
+# RMSE
+rmse <- function(actual, pred){
+  rmse <- sqrt(mean((actual - pred)^2))
+  return (rmse)
+}
+
+# Significativitá regressori
+pars_test <- function(coef, var_coef){
+  test <- (1-pnorm(abs(coef)/sqrt(diag(var_coef))))*2
+  return(test)
+}
+```
+
+```{r}
+working_dir = dirname(rstudioapi::getSourceEditorContext()$path)
+setwd(working_dir) # lo applica solo a questo chunk!
+
+data <- read.csv("data2022_train.csv", colClasses=c("character", "numeric"))
+```
+
+Trasformazione in serie storica XTS
+
+```{r}
+data_xts <- xts(data$y, order.by = as.POSIXct(data$X, format="%Y-%m-%d %H:%M:%S", tz="GMT"))
+```
+
+## Data Exploration
+
+```{r}
+summary(data_xts)
+```
+
+```{r}
+plot(data_xts)
+```
+
+```{r}
+plot(aggregate(data_xts, month, mean))
+```
+
+```{r}
+plot(data_xts[seq(1, nrow(data), 144)])
+plot(data_xts[1:144])
+plot(data_xts[1:144*21])
+```
+
+## Data Prediction
+
+### UCM Model
+
+### Mod 1
+
+```{r}
+date_val <- 280
+train <- data_xts
+train[(144*date_val+1):nrow(train),] <- NA
+```
+
+```{r}
+ucm_pre <- function(train) {
+  # Definizione del modello
+  mod <- SSModel(V1~SSMtrend(2, list(NA, NA))+
+                    SSMseasonal(144, NA, "trigonometric", harmonics = 1:2)+
+                    SSMseasonal(1008, NA, "trigonometric", harmonics = 1),
+                  H=NA, 
+                  data=train)
+
+  # Assegna i valori iniziali ai parametri, parte da 0.
+  mod$P1inf[] <- 0 # no componenti diffuse
+  mod$a1[1] <- mean(log(train[1:(144)])) # scelta basata sui valori del primo mese
+  
+  vy <- var(log(train[1:(144)])) # varianza serie storica (utilizzata sotto per dare un ordine di grandezza)
+  diag(mod$P1) <- vy*10 # specifichiamo che abbiamo molta incertezza sui valori che abbiamo specificato
+  
+  #Inizializzazione delle varianze sulla base di vy
+  pars <- log(c(
+    logVarEta = vy/100000,
+    logVarZeta = vy/150,
+    logVarOm144 = vy,
+    logVarOm1008 = vy/100,
+    logVarEps = vy/10
+  ))
+  
+  # funzione di update
+  updt <- function(pars, model){
+    model$Q[1,1,1] <- exp(pars[1])
+    model$Q[2,2,1] <- exp(pars[2])
+    diag(model$Q[3:6, 3:6, 1]) <- exp(pars[3])
+    diag(model$Q[7:8, 7:8, 1]) <- exp(pars[4])
+    model$H[1,1,1] <- exp(pars[5])
+    model
+  }
+  
+  # Train - Si allena sui valori passati (quindi quei valori di train non nulli)
+  fit <- fitSSM(mod, pars, updt)
+  fit$optim.out
+  
+  # Filtro di karman - Effetua le predizioni - kfs1$muhat contiene una serie storica predetta (anche i dati di train vengono predetti)
+  kfs <- KFS(fit$model,
+            smoothing = c("state", "signal", "disturbance"))
+  
+  # conversione muhat in serie storica
+  muhat <- xts(as.matrix(kfs$muhat),
+                index(train))
+  muhat <- as.xts(muhat)
+  return(muhat)
+}
+```
+
+```{r}
+pred <- ucm_pre(train)
+```
+
+```{r}
+plot(data_xts-pred)
+plot(data_xts[(144*(date_val-5)+1):nrow(train),], lwd=3) # serie storica
+lines(pred[(144*(date_val-5)+1):nrow(train),], type = "l", col = "red", lwd=3) # serie predetta [1801:1826,]
+```
+
+\-
+
+```{r}
+plot(data_xts[(144*331+1):nrow(train),], lwd=3) # serie storica
+lines(pred[(144*331+1):nrow(train),], type = "l", col = "red", lwd=3) # serie predetta [1801:1826,]
+```
+
+```{r}
+mape(data_xts[(144*304+1):nrow(train)], pred[(144*304+1):nrow(train)])
+rmse(data_xts[(144*304+1):nrow(train)], pred[(144*304+1):nrow(train)])
+```
+
+### Mod 2
+
+```{r}
+ucm_pre <- function(train) {
+  arm144 <- 10
+  arm1008 <- 1
+  # Definizione del modello
+  mod <- SSModel(V1~SSMtrend(2, list(NA, NA))+
+                    SSMseasonal(144, NA, "trigonometric", harmonics = 1:arm144)+
+                    SSMseasonal(1008, NA, "trigonometric", harmonics = 1:arm1008),
+                  H=NA, 
+                  data=train)
+
+  # Assegna i valori iniziali ai parametri, parte da 0.
+  mod$P1inf[] <- 0 # no componenti diffuse
+  mod$a1[1] <- mean(train[1:(144)]) # expected value of the initial state vector α[1]
+  
+  vy <- var(train[1:(144)]) # varianza serie storica (utilizzata sotto per dare un ordine di grandezza)
+  diag(mod$P1) <- vy*10 # specifichiamo che abbiamo molta incertezza sui valori che abbiamo specificato
+  
+  #Inizializzazione delle varianze sulla base di vy
+  pars <- log(c(
+    logVarEta = vy/10000,
+    logVarZeta = vy/100000,
+    logVarOm144 = vy/1000,
+    logVarOm1008 = vy/100000,
+    logVarEps = vy/1000
+  ))
+  
+  # funzione di update
+  updt <- function(pars, model){
+    model$Q[1,1,1] <- exp(pars[1])
+    model$Q[2,2,1] <- exp(pars[2])
+    diag(model$Q[3:(2+arm144*2), 3:(2+arm144*2), 1]) <- exp(pars[3])
+    diag(model$Q[(3+arm144*2):(2+arm144*2+arm1008*2), (3+arm144*2):(2+arm144*2+arm1008*2), 1]) <- exp(pars[4])
+    model$H[1,1,1] <- exp(pars[5])
+    model
+  }
+  
+  # Train - Si allena sui valori passati (quindi quei valori di train non nulli)
+  fit <- fitSSM(mod, pars, updt)
+  print(fit$optim.out)
+  
+  # Filtro di karman - Effetua le predizioni - kfs1$muhat contiene una serie storica predetta (anche i dati di train vengono predetti)
+  kfs <- KFS(fit$model,
+            smoothing = c("state", "signal", "disturbance"))
+  
+  # conversione muhat in serie storica
+  muhat <- xts(as.matrix(kfs$muhat),
+                index(train))
+  muhat <- as.xts(muhat)
+  return(muhat)
+}
+```
+
+```{r}
+pred <- ucm_pre(train)
+```
+
+```{r}
+plot(data_xts-pred)
+plot(data_xts[(144*(date_val-25)+1):nrow(train),], lwd=3) # serie storica
+lines(pred[(144*(date_val-25)+1):nrow(train),], type = "l", col = "red", lwd=3) # serie predetta [1801:1826,]
+```
+
+```{r}
+plot(data_xts[(144*331+1):nrow(train),], lwd=3) # serie storica
+lines(pred[(144*331+1):nrow(train),], type = "l", col = "red", lwd=3) # serie predetta [1801:1826,]
+```
+
+```{r}
+plot(data_xts[(144*320+1):(144*323+1),], lwd=3)
+lines(pred[(144*320+1):(144*323+1),], type = "l", col = "red", lwd=3)
+```
+
+```{r}
+mape(data_xts[(144*304+1):nrow(train)], pred[(144*304+1):nrow(train)]) |> round(2)
+rmse(data_xts[(144*304+1):nrow(train)], pred[(144*304+1):nrow(train)]) |> round(2)
+mae(data_xts[(144*304+1):nrow(train)], pred[(144*304+1):nrow(train)]) |> round(2)
+```
+
+Minimo
+
+[1] 4.81
+
+[1] 1718.4
+
+[1] 1366.99
+
+### Mod 3
+
+```{r}
+ucm_pre <- function(train) {
+  # Definizione del modello
+  mod <- SSModel(V1~SSMtrend(2, list(NA, NA))+
+                    SSMseasonal(144, NA, "trigonometric", harmonics = 1:2)+
+                    SSMseasonal(1008, NA, "trigonometric", harmonics = 1),
+                  H=NA, # Covariance matrix or array of disturbance terms ε[t] of observation equation
+                  data=train)
+
+  mod$P1inf[] <- 0 # diffuse part of P[1] (p[1] is the covariance matrix of α[1])
+  mod$a1[1] <- mean(train[1:(144*3)]) # valore del livello iniziale (basata sulla media dei primi 3 giorni)
+  
+  vy <- var(log(train[1:(144)])) # varianza serie storica (utilizzata sotto per dare un ordine di grandezza)
+  diag(mod$P1) <- vy*10 # specifichiamo che abbiamo molta incertezza sui valori che abbiamo specificato
+  
+  # definisco le varianze a partire da vy
+  pars <- log(c(
+    logVarEta = vy/1000,
+    logVarZeta = vy/150,
+    logVarOm144 = vy/10,
+    logVarOm1008 = vy/1000,
+    logVarEps = vy/10000
+  ))
+  
+  # funzione di update -> imposto i valori iniziali
+  updt <- function(pars, model){
+    model$Q[1,1,1] <- exp(pars[1]) # livello
+    model$Q[2,2,1] <- exp(pars[2]) # slope
+    diag(model$Q[3:6, 3:6, 1]) <- exp(pars[3]) # stagionalitá giornaliera
+    diag(model$Q[7:8, 7:8, 1]) <- exp(pars[4]) # stagionalitá settimanale
+    model$H[1,1,1] <- exp(pars[5]) # termini di errore
+    model
+  }
+  
+  # Train - Si allena sui valori passati (quindi quei valori di train non nulli)
+  fit <- fitSSM(mod, pars, updt)
+  fit$optim.out
+  
+  # Filtro di karman - Effetua le predizioni - kfs1$muhat contiene una serie storica predetta (anche i dati di train vengono predetti)
+  kfs <- KFS(fit$model,
+            smoothing = c("state", "signal", "disturbance"))
+  
+  # conversione muhat in serie storica
+  muhat <- xts(as.matrix(kfs$muhat),
+                index(train))
+  muhat <- as.xts(muhat)
+  return(muhat)
+}
+```
+
+```{r}
+pred <- ucm_pre(train)
+```
+
+```{r}
+plot(data_xts-pred)
+plot(data_xts[(144*300+1):nrow(train),], lwd=3) # serie storica
+lines(pred[(144*300+1):nrow(train),], type = "l", col = "red", lwd=3) # serie predetta [1801:1826,]
+```
+
+```{r}
+plot(data_xts[(144*331+1):nrow(train),], lwd=3) # serie storica
+lines(pred[(144*331+1):nrow(train),], type = "l", col = "red", lwd=3) # serie predetta [1801:1826,]
+```
