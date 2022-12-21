@@ -5,14 +5,16 @@ date: "2022-12-11"
 output: html_document
 ---
 
-# Time series forecast:
+# Time series forecast
 
 ## Setup and loading dataset
 
 ```{r}
 set.seed(100)
 
-packages <- c("KFAS", "xts") # librerie
+Sys.setenv(TZ='GMT') # imposto la time zone
+
+packages <- c("forecast", "KFAS", "xts", "fastDummies") # librerie
 
 installed_packages <- packages %in% rownames(installed.packages())
 if (any(installed_packages == FALSE)) {
@@ -24,22 +26,12 @@ invisible(lapply(packages, library, character.only = TRUE))
 ```
 
 ```{r}
-# MAPE 
-mape <- function(actual,pred){
-  mape <- mean(abs((actual - pred)/actual))*100
-  return (mape)
-}
-
-# MAE
-mae <- function(actual,pred){
-  mae <- mean(abs(actual - pred))
-  return (mae)
-}
-
-# RMSE
-rmse <- function(actual, pred){
+stats <- function(actual,pred){
   rmse <- sqrt(mean((actual - pred)^2))
-  return (rmse)
+  mape <- mean(abs((actual - pred)/actual))*100
+  mae <- mean(abs(actual - pred))
+  cat("RMSE", rmse, "\nMAPE", mape, "\nMAE ", mae)
+  #return(c(rmse, mape, mae))
 }
 
 # Significativitá regressori
@@ -51,15 +43,39 @@ pars_test <- function(coef, var_coef){
 
 ```{r}
 working_dir = dirname(rstudioapi::getSourceEditorContext()$path)
-setwd(working_dir) # lo applica solo a questo chunk!
+setwd(working_dir)
 
 data <- read.csv("data2022_train.csv", colClasses=c("character", "numeric"))
 ```
 
-Trasformazione in serie storica XTS
+### Trasformazione in serie storica XTS
 
 ```{r}
-data_xts <- xts(data$y, order.by = as.POSIXct(data$X, format="%Y-%m-%d %H:%M:%S", tz="GMT"))
+data_xts <- xts(data$y, as.POSIXct(data$X, format="%Y-%m-%d %H:%M:%S", tz="GMT"))
+```
+
+### Train, validation e test set
+
+```{r}
+tseq <- seq(from = index(data_xts[length(data_xts),])+600, length.out = 144*30, by = 600)
+print(paste0("from: ", tseq[1], "  to: ", tseq[length(tseq)]))
+test_xts <- xts(rep(NA, length(tseq)),tseq)
+data_xts_complete <- c(data_xts, test_xts)
+```
+
+```{r}
+val_date <- "2017-11-01 00:00:00"
+val_index <- which(index(data_xts_complete) == val_date)
+test_date <- "2017-12-01 00:00:00"
+test_index <- which(index(data_xts_complete) == test_date)
+print(paste0("val_index: ", val_index, " test_index: ", test_index))
+```
+
+```{r}
+train <- data_xts_complete[1:(val_index-1)]
+val <- data_xts_complete[val_index:(test_index-1),]
+test <- data_xts_complete[test_index:length(data_xts_complete)]
+print(paste0("train: ", length(train), "  val: ", length(val), "  test: ", length(test)))
 ```
 
 ## Data Exploration
@@ -82,17 +98,115 @@ plot(data_xts[1:144])
 plot(data_xts[1:144*21])
 ```
 
-## Data Prediction
+```{r}
+autoplot(mstl(data_xts))
+```
 
-### UCM Model
-
-### Mod 1
+### Detecting outliers
 
 ```{r}
-date_val <- 280
-train <- data_xts
-train[(144*date_val+1):nrow(train),] <- NA
+plot(diff(data_xts,1))
+data_xts[diff(data_xts,1) < -5000 | diff(data_xts,1) > 5000] #|> index() |> as.Date()
 ```
+
+## Data Prediction
+
+### ARIMA Models
+
+-   modellare settimana con dummy
+
+-   modellare giorno con differenza stagionale
+
+```{r}
+dummy_week <- fastDummies::dummy_cols(format(index(train), "%u"), remove_selected_columns = TRUE, remove_first_dummy = TRUE)
+colnames(dummy_week) <- c("mart", "merc", "giov", "ven", "sab", "dom")
+train_arima <- merge(train, dummy_week)
+```
+
+```{r}
+tsdisplay(train)
+```
+
+```{r}
+train |> Acf(300)
+train |> 
+  diff() |>
+  diff(144) |>
+  Acf(300)
+```
+
+```{r}
+train |> Pacf(300)
+train |>
+  diff(144) |>
+  diff() |>
+  Pacf(300)
+```
+
+#### Mod 1
+
+```{r}
+periodicity(train)
+g<- zoo(train)
+periodicity(g)
+```
+
+```{r}
+mod1 <- Arima(y = g[(144*250):length(train)], # subset del train
+              order = c(0, 1, 1),
+              list(order = c(0, 1, 1), period = 144), # gli specifichiamo la frequenza
+              include.constant = TRUE)
+summary(mod1)
+```
+
+```{r}
+mod1.plot_diagnostics(figsize=c(7,5))
+plt.show()
+```
+
+```{r}
+plot(index(mod1$residuals)/600/144, mod1$residuals, type='l', xlab='Day', ylab='Residual')
+```
+
+```{r}
+a <- forecast(mod1, 1000)
+plot(a)
+abline(v=val_index*600)
+```
+
+### UCM Models
+
+Definisco il train set per i modelli ucm e una versione ridotta per velocizzare il train
+
+```{r}
+train_ucm <- data_xts
+train_ucm[val_index:nrow(train_ucm),] <- NA
+
+small_date <- "2017-10-01 00:00:00"
+small_index <- which(index(data_xts_complete) == small_date)
+small <- train_ucm[small_index:length(train_ucm)] # train piu veloce
+```
+
+Funzione per plottare le predizioni
+
+```{r}
+plot_pred <- function(pred, days=FALSE){
+  #date_temp <- which(index(pred) == val_date)
+  if (days==FALSE){
+    par(mfrow=c(2, 1))
+    plot(data_xts[(val_index-5):length(data_xts)]-pred)
+    plot(data_xts[(val_index-5):length(data_xts)], lwd=3) # serie storica
+    lines(pred, type = "l", col = "red", lwd=3) # serie predetta
+  }
+  
+  else{
+    plot(data_xts[(length(data_xts)-144*days):length(data_xts),], lwd=3) # serie storica
+    lines(pred[(length(pred)-144*days):length(pred),], type = "l", col = "red", lwd=3)
+  }
+}
+```
+
+#### Mod 1
 
 ```{r}
 ucm_pre <- function(train) {
@@ -146,28 +260,22 @@ ucm_pre <- function(train) {
 ```
 
 ```{r}
-pred <- ucm_pre(train)
+pred <- ucm_pre(train_ucm)
 ```
 
 ```{r}
-plot(data_xts-pred)
-plot(data_xts[(144*(date_val-5)+1):nrow(train),], lwd=3) # serie storica
-lines(pred[(144*(date_val-5)+1):nrow(train),], type = "l", col = "red", lwd=3) # serie predetta [1801:1826,]
-```
-
-\-
-
-```{r}
-plot(data_xts[(144*331+1):nrow(train),], lwd=3) # serie storica
-lines(pred[(144*331+1):nrow(train),], type = "l", col = "red", lwd=3) # serie predetta [1801:1826,]
+plot_pred(pred)
 ```
 
 ```{r}
-mape(data_xts[(144*304+1):nrow(train)], pred[(144*304+1):nrow(train)])
-rmse(data_xts[(144*304+1):nrow(train)], pred[(144*304+1):nrow(train)])
+plot_pred(pred, 4)
 ```
 
-### Mod 2
+```{r}
+stats(data_xts[(144*304+1):nrow(train_ucm)], pred[(144*304+1):nrow(train_ucm)])
+```
+
+#### Mod 2
 
 ```{r}
 ucm_pre <- function(train) {
@@ -223,29 +331,19 @@ ucm_pre <- function(train) {
 ```
 
 ```{r}
-pred <- ucm_pre(train)
+pred <- ucm_pre(train_ucm)
 ```
 
 ```{r}
-plot(data_xts-pred)
-plot(data_xts[(144*(date_val-25)+1):nrow(train),], lwd=3) # serie storica
-lines(pred[(144*(date_val-25)+1):nrow(train),], type = "l", col = "red", lwd=3) # serie predetta [1801:1826,]
+plot_pred(pred)
 ```
 
 ```{r}
-plot(data_xts[(144*331+1):nrow(train),], lwd=3) # serie storica
-lines(pred[(144*331+1):nrow(train),], type = "l", col = "red", lwd=3) # serie predetta [1801:1826,]
+plot_pred(pred, 4)
 ```
 
 ```{r}
-plot(data_xts[(144*320+1):(144*323+1),], lwd=3)
-lines(pred[(144*320+1):(144*323+1),], type = "l", col = "red", lwd=3)
-```
-
-```{r}
-mape(data_xts[(144*304+1):nrow(train)], pred[(144*304+1):nrow(train)]) |> round(2)
-rmse(data_xts[(144*304+1):nrow(train)], pred[(144*304+1):nrow(train)]) |> round(2)
-mae(data_xts[(144*304+1):nrow(train)], pred[(144*304+1):nrow(train)]) |> round(2)
+stats(data_xts[(length(data_xts)-144*30+1):length(data_xts)], pred[(length(pred)-144*30+1):length(pred)])
 ```
 
 Minimo
@@ -256,45 +354,48 @@ Minimo
 
 [1] 1366.99
 
-### Mod 3
+#### Mod 3
 
 ```{r}
 ucm_pre <- function(train) {
+  arm144 <- 10
+  arm1008 <- 1
   # Definizione del modello
   mod <- SSModel(V1~SSMtrend(2, list(NA, NA))+
-                    SSMseasonal(144, NA, "trigonometric", harmonics = 1:2)+
-                    SSMseasonal(1008, NA, "trigonometric", harmonics = 1),
+                    SSMseasonal(144, NA, "trigonometric", harmonics = 1:arm144)+
+                    SSMseasonal(1008, NA, "trigonometric", harmonics = 1:arm1008),
                   H=NA, # Covariance matrix or array of disturbance terms ε[t] of observation equation
                   data=train)
-
+  
   mod$P1inf[] <- 0 # diffuse part of P[1] (p[1] is the covariance matrix of α[1])
   mod$a1[1] <- mean(train[1:(144*3)]) # valore del livello iniziale (basata sulla media dei primi 3 giorni)
-  
-  vy <- var(log(train[1:(144)])) # varianza serie storica (utilizzata sotto per dare un ordine di grandezza)
-  diag(mod$P1) <- vy*10 # specifichiamo che abbiamo molta incertezza sui valori che abbiamo specificato
+  vy <- var(log(train[1:(144)])) # varianza serie storica ((utilizzata sotto per dare un ordine di grandezza))primo giorno)
+  diag(mod$P1) <- vy * 10 # specifichiamo che abbiamo molta incertezza sui valori che abbiamo specificato
   
   # definisco le varianze a partire da vy
   pars <- log(c(
-    logVarEta = vy/1000,
-    logVarZeta = vy/150,
-    logVarOm144 = vy/10,
-    logVarOm1008 = vy/1000,
-    logVarEps = vy/10000
+    logVarEta = vy/100000,
+    logVarZeta = vy/1500,
+    logVarOm144 = vy/1,
+    logVarOm1008 = vy/10000,
+    logVarEps = vy/100
   ))
   
   # funzione di update -> imposto i valori iniziali
   updt <- function(pars, model){
-    model$Q[1,1,1] <- exp(pars[1]) # livello
-    model$Q[2,2,1] <- exp(pars[2]) # slope
-    diag(model$Q[3:6, 3:6, 1]) <- exp(pars[3]) # stagionalitá giornaliera
-    diag(model$Q[7:8, 7:8, 1]) <- exp(pars[4]) # stagionalitá settimanale
-    model$H[1,1,1] <- exp(pars[5]) # termini di errore
+    m <- arm144*2
+    n <- arm1008*2
+    model$Q[1,1,1] <- exp(pars[1])
+    model$Q[2,2,1] <- exp(pars[2])
+    diag(model$Q[3:(2+m), 3:(2+m), 1]) <- exp(pars[3])
+    diag(model$Q[(3+m):(2+m+n), (3+m):(2+m+n), 1]) <- exp(pars[4])
+    model$H[1,1,1] <- exp(pars[5])
     model
   }
   
   # Train - Si allena sui valori passati (quindi quei valori di train non nulli)
   fit <- fitSSM(mod, pars, updt)
-  fit$optim.out
+  print(fit$optim.out)
   
   # Filtro di karman - Effetua le predizioni - kfs1$muhat contiene una serie storica predetta (anche i dati di train vengono predetti)
   kfs <- KFS(fit$model,
@@ -309,16 +410,13 @@ ucm_pre <- function(train) {
 ```
 
 ```{r}
-pred <- ucm_pre(train)
+pred <- ucm_pre(small)
 ```
 
 ```{r}
-plot(data_xts-pred)
-plot(data_xts[(144*300+1):nrow(train),], lwd=3) # serie storica
-lines(pred[(144*300+1):nrow(train),], type = "l", col = "red", lwd=3) # serie predetta [1801:1826,]
+plot_pred(pred)
 ```
 
 ```{r}
-plot(data_xts[(144*331+1):nrow(train),], lwd=3) # serie storica
-lines(pred[(144*331+1):nrow(train),], type = "l", col = "red", lwd=3) # serie predetta [1801:1826,]
+plot_pred(pred, 4)
 ```
