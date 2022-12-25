@@ -14,7 +14,7 @@ set.seed(100)
 
 Sys.setenv(TZ='GMT') # imposto la time zone
 
-packages <- c("forecast", "KFAS", "xts", "fastDummies") # librerie
+packages <- c("forecast", "KFAS", "xts", "fastDummies", "tsfknn") # librerie
 
 installed_packages <- packages %in% rownames(installed.packages())
 if (any(installed_packages == FALSE)) {
@@ -41,6 +41,19 @@ pars_test <- function(coef, var_coef){
 }
 ```
 
+Funzione per plottare le predizioni
+
+```{r}
+plot_pred <- function(pred, days=3){
+  diff <- plot(data_xts[(val_index-144*5):(val_index+144*npred-1)]-pred) # serie storica - storica
+  plot <- plot(data_xts[(val_index-144*5):(val_index+144*npred-1)], lwd=3) # serie storica e storica
+  plot <- lines(pred, type = "l", col = "red", lwd=3)
+  zoom <- plot(data_xts[(val_index+144*(npred-days)):(val_index+144*npred-1)], lwd=3) # zoom serie storica e storica
+  zoom <- lines(pred, type = "l", col = "red", lwd=3)
+  c(diff, plot, zoom)
+}
+```
+
 ```{r}
 working_dir = dirname(rstudioapi::getSourceEditorContext()$path)
 setwd(working_dir)
@@ -54,34 +67,18 @@ data <- read.csv("data2022_train.csv", colClasses=c("character", "numeric"))
 data_xts <- xts(data$y, as.POSIXct(data$X, format="%Y-%m-%d %H:%M:%S", tz="GMT"))
 ```
 
-### Train, validation e test set
-
 ```{r}
-tseq <- seq(from = index(data_xts[length(data_xts),])+600, length.out = 144*30, by = 600)
-print(paste0("from: ", tseq[1], "  to: ", tseq[length(tseq)]))
-test_xts <- xts(rep(NA, length(tseq)),tseq)
-data_xts_complete <- c(data_xts, test_xts)
-```
-
-```{r}
-val_date <- "2017-11-01 00:00:00"
-val_index <- which(index(data_xts_complete) == val_date)
-test_date <- "2017-12-01 00:00:00"
-test_index <- which(index(data_xts_complete) == test_date)
-print(paste0("val_index: ", val_index, " test_index: ", test_index))
-```
-
-```{r}
-train <- data_xts_complete[1:(val_index-1)]
-val <- data_xts_complete[val_index:(test_index-1),]
-test <- data_xts_complete[test_index:length(data_xts_complete)]
-print(paste0("train: ", length(train), "  val: ", length(val), "  test: ", length(test)))
+periodicity(data_xts)
 ```
 
 ## Data Exploration
 
 ```{r}
 summary(data_xts)
+```
+
+```{r}
+tsdisplay(train)
 ```
 
 ```{r}
@@ -102,6 +99,16 @@ plot(data_xts[1:144*21])
 autoplot(mstl(data_xts))
 ```
 
+### Dipendenza in varianza
+
+```{r}
+med <- tapply(data_xts, rep(1:334, each = 144), mean)
+sds <- tapply(data_xts, rep(1:334, each = 144), sd)
+plot(med, sds)
+```
+
+Forse é meglio lavorare con i logaritmi
+
 ### Detecting outliers
 
 ```{r}
@@ -109,69 +116,211 @@ plot(diff(data_xts,1))
 data_xts[diff(data_xts,1) < -5000 | diff(data_xts,1) > 5000] #|> index() |> as.Date()
 ```
 
-## Data Prediction
+```{r}
+par(mfrow=c(2,2))
+plot(data_xts["2017-01-14"])
+#plot(train["2017-01-15"])
+plot(data_xts["2017-03-28"])
+plot(data_xts["2017-04-20"])
+plot(data_xts["2017-05-31"])
+```
 
-### ARIMA Models
-
--   modellare settimana con dummy
-
--   modellare giorno con differenza stagionale
+### Train, validation e test set
 
 ```{r}
-dummy_week <- fastDummies::dummy_cols(format(index(train), "%u"), remove_selected_columns = TRUE, remove_first_dummy = TRUE)
-colnames(dummy_week) <- c("mart", "merc", "giov", "ven", "sab", "dom")
-train_arima <- merge(train, dummy_week)
+tseq <- seq(from = index(data_xts[nrow(data_xts),])+600, length.out = 144*30, by = 600)
+data_xts_complete <- c(data_xts, xts(rep(as.numeric(NA), length(tseq)), tseq))
+cat(paste0("from: ", index(data_xts_complete[1]), "\nto:   ", index(data_xts_complete[nrow(data_xts_complete)])))
 ```
 
 ```{r}
-tsdisplay(train)
+npred <- 30 # numero di giorni da predire
+small_date <- "2017-10-01 00:00:00"
+small_index <- which(index(data_xts_complete) == small_date)
+val_date <- "2017-11-01 00:00:00"
+val_index <- which(index(data_xts_complete) == val_date)
+test_date <- "2017-12-01 00:00:00"
+test_index <- which(index(data_xts_complete) == test_date)
+cat(paste0("small_index: ", small_index,"\nval_index:   ", val_index, "\ntest_index:  ", test_index))
+```
+
+```{r}
+train <- data_xts_complete[1:(val_index-1)]
+small <- data_xts_complete[small_index:(val_index-1)] # train piu veloce
+val <- data_xts_complete[val_index:(val_index+144*npred-1),]
+test <- data_xts_complete[test_index:nrow(data_xts_complete)]
+cat(paste0("small: ", nrow(small), "\ntrain: ", nrow(train), "\nval:   ", nrow(val), "\ntest:  ", nrow(test)))
+```
+
+## Data Modeling
+
+### ARIMA Models
+
+-   Possibilita 1
+
+    -   modellare settimana con dummy
+
+    -   modellare giorno con differenza stagionale
+
+-   Possibilita 2
+
+    -   144 modelli per togliere stagionalita giornaliera
+
+```{r}
+train_dummy <- fastDummies::dummy_cols(format(index(train), "%u"), remove_selected_columns = TRUE, remove_first_dummy = TRUE)
+rownames(train_dummy) <- index(train)
+colnames(train_dummy) <- c("mart", "merc", "giov", "ven", "sab", "dom")
+train_dummy <- as.matrix(train_dummy)
+
+val_dummy <- fastDummies::dummy_cols(format(index(val), "%u"), remove_selected_columns = TRUE, remove_first_dummy = TRUE)
+rownames(val_dummy) <- index(val)
+colnames(val_dummy) <- c("mart", "merc", "giov", "ven", "sab", "dom")
+val_dummy <- as.matrix(val_dummy)
+
+#train_arima <- cbind(train, train_dummy)
+```
+
+Stimo i parametri (p, q, d)
+
+```{r}
+ndiffs(train)
 ```
 
 ```{r}
 train |> Acf(300)
-train |> 
+train |> #[42000:length(train)]
+  #diff() |>
   diff() |>
-  diff(144) |>
+  #diff(144*7) |>
+  #diff(144) |>
+  #autoplot()
   Acf(300)
+#train[diff(diff(train, 144), 1) < -4000]
 ```
 
 ```{r}
 train |> Pacf(300)
 train |>
-  diff(144) |>
+  #diff(144) |>
   diff() |>
   Pacf(300)
+```
+
+```{r}
+nsdiffs(train)
 ```
 
 #### Mod 1
 
 ```{r}
-periodicity(train)
-g<- zoo(train)
-periodicity(g)
-```
-
-```{r}
-mod1 <- Arima(y = g[(144*250):length(train)], # subset del train
+mod1 <- Arima(y = ts(train[(length(train)-144*14):length(train)]), # subset del train
               order = c(0, 1, 1),
               list(order = c(0, 1, 1), period = 144), # gli specifichiamo la frequenza
+              #xreg = dummy_week,
               include.constant = TRUE)
 summary(mod1)
 ```
 
 ```{r}
-mod1.plot_diagnostics(figsize=c(7,5))
-plt.show()
+#mod1.plot_diagnostics(figsize=c(7,5))
+#plt.show()
 ```
 
 ```{r}
-plot(index(mod1$residuals)/600/144, mod1$residuals, type='l', xlab='Day', ylab='Residual')
+# plot(index(mod1$residuals)/600/144, mod1$residuals, type='l', xlab='Day', ylab='Residual')
 ```
 
 ```{r}
-a <- forecast(mod1, 1000)
-plot(a)
+pred <- forecast(mod1, 144*npred)
+plot(pred)
+#abline(v=val_index*600)
+```
+
+```{r}
+pred <- xts(pred$mean, index(val))
+```
+
+```{r}
+plot_pred(pred)
+```
+
+```{r}
+stats(val, pred)
+```
+
+#### Mod 2
+
+```{r}
+mod2 <- Arima(y = ts(small[(length(small)-14*144):length(small)]), # subset del train
+              order = c(0, 1, 1),
+              list(order = c(0, 1, 1), period = 144), # gli specifichiamo la frequenza
+              #xreg = dummy_week,
+              include.constant = TRUE)
+summary(mod2)
+```
+
+```{r}
+pred2 <- forecast(mod2, 144*npred, xreg=val_dummy)
+plot(pred2)
 abline(v=val_index*600)
+```
+
+```{r}
+pred2 <- xts(pred2$mean, index(val))
+```
+
+```{r}
+plot_pred(pred2)
+```
+
+```{r}
+stats(val, pred2)
+```
+
+#### Mod 3
+
+```{r}
+mod3 <- auto.arima(ts(small, frequency = 144),
+                   stepwise = TRUE,
+                   approximation = TRUE,
+                   xreg = dummy_week[small_index:nrow(dummy_week),]) # Minimizza AIC
+mod3
+```
+
+```{r}
+mod3 <- Arima(y = ts(small[(length(small)-14*144):length(small)]), # subset del train
+              order = c(2, 1, 0),
+              list(order = c(0, 1, 1), period = 144), # gli specifichiamo la frequenza
+              #xreg = dummy_week,
+              include.constant = TRUE)
+mod3
+```
+
+ARIMA(2,1,0)(0,1,0)[144]
+
+```{r}
+pred3 <- forecast(mod3,
+                  144*npred)
+                  #xreg = val_dummy)
+plot(pred3)
+abline(v=val_index*600)
+```
+
+```{r}
+pred3 <- xts(pred3$mean, index(val))
+plot_pred(pred3)
+```
+
+```{r}
+o <- Arima(ts(small, frequency = 144),
+           order = c(1, 0, 0),
+           seasonal = list(order = c(0, 1, 2)))
+pred3 <- forecast(o, h = 144*npred)
+```
+
+```{r}
+pred3 <- xts(pred3$mean, index(val))
+plot_pred(pred3)
 ```
 
 ### UCM Models
@@ -179,31 +328,9 @@ abline(v=val_index*600)
 Definisco il train set per i modelli ucm e una versione ridotta per velocizzare il train
 
 ```{r}
-train_ucm <- data_xts
-train_ucm[val_index:nrow(train_ucm),] <- NA
-
-small_date <- "2017-10-01 00:00:00"
-small_index <- which(index(data_xts_complete) == small_date)
-small <- train_ucm[small_index:length(train_ucm)] # train piu veloce
-```
-
-Funzione per plottare le predizioni
-
-```{r}
-plot_pred <- function(pred, days=FALSE){
-  #date_temp <- which(index(pred) == val_date)
-  if (days==FALSE){
-    par(mfrow=c(2, 1))
-    plot(data_xts[(val_index-5):length(data_xts)]-pred)
-    plot(data_xts[(val_index-5):length(data_xts)], lwd=3) # serie storica
-    lines(pred, type = "l", col = "red", lwd=3) # serie predetta
-  }
-  
-  else{
-    plot(data_xts[(length(data_xts)-144*days):length(data_xts),], lwd=3) # serie storica
-    lines(pred[(length(pred)-144*days):length(pred),], type = "l", col = "red", lwd=3)
-  }
-}
+tseq <- seq(from = index(train[nrow(train),])+600,length.out = 144*npred,by = 600) # creo sequenza di NA a step di 10 min
+train_ucm <- c(train, xts(rep(as.numeric(NA), length(tseq)), tseq)) # aggiungo NA a train
+small_ucm <- c(small, xts(rep(as.numeric(NA), length(tseq)), tseq)) # aggiungo NA a small
 ```
 
 #### Mod 1
@@ -219,9 +346,9 @@ ucm_pre <- function(train) {
 
   # Assegna i valori iniziali ai parametri, parte da 0.
   mod$P1inf[] <- 0 # no componenti diffuse
-  mod$a1[1] <- mean(log(train[1:(144)])) # scelta basata sui valori del primo mese
+  mod$a1[1] <- mean(log(train[1:144])) # scelta basata sui valori del primo mese
   
-  vy <- var(log(train[1:(144)])) # varianza serie storica (utilizzata sotto per dare un ordine di grandezza)
+  vy <- var(log(train[1:144])) # varianza serie storica (utilizzata sotto per dare un ordine di grandezza)
   diag(mod$P1) <- vy*10 # specifichiamo che abbiamo molta incertezza sui valori che abbiamo specificato
   
   #Inizializzazione delle varianze sulla base di vy
@@ -268,11 +395,7 @@ plot_pred(pred)
 ```
 
 ```{r}
-plot_pred(pred, 4)
-```
-
-```{r}
-stats(data_xts[(144*304+1):nrow(train_ucm)], pred[(144*304+1):nrow(train_ucm)])
+stats(data_xts[val_index:(val_index+144*npred-1)], pred[(nrow(pred)-144*npred+1):nrow(pred)])
 ```
 
 #### Mod 2
@@ -290,9 +413,9 @@ ucm_pre <- function(train) {
 
   # Assegna i valori iniziali ai parametri, parte da 0.
   mod$P1inf[] <- 0 # no componenti diffuse
-  mod$a1[1] <- mean(train[1:(144)]) # expected value of the initial state vector α[1]
+  mod$a1[1] <- mean(train[1:144]) # expected value of the initial state vector α[1]
   
-  vy <- var(train[1:(144)]) # varianza serie storica (utilizzata sotto per dare un ordine di grandezza)
+  vy <- var(train[1:144]) # varianza serie storica (utilizzata sotto per dare un ordine di grandezza)
   diag(mod$P1) <- vy*10 # specifichiamo che abbiamo molta incertezza sui valori che abbiamo specificato
   
   #Inizializzazione delle varianze sulla base di vy
@@ -339,20 +462,14 @@ plot_pred(pred)
 ```
 
 ```{r}
-plot_pred(pred, 4)
-```
-
-```{r}
-stats(data_xts[(length(data_xts)-144*30+1):length(data_xts)], pred[(length(pred)-144*30+1):length(pred)])
+stats(data_xts[val_index:(val_index+144*npred-1)], pred[(nrow(pred)-144*npred+1):nrow(pred)])
 ```
 
 Minimo
 
-[1] 4.81
-
-[1] 1718.4
-
-[1] 1366.99
+    RMSE 1718.399 
+    MAPE 4.814626 
+    MAE  1366.986
 
 #### Mod 3
 
@@ -410,7 +527,7 @@ ucm_pre <- function(train) {
 ```
 
 ```{r}
-pred <- ucm_pre(small)
+pred <- ucm_pre(small_ucm) # fare predizioni su 
 ```
 
 ```{r}
@@ -418,5 +535,87 @@ plot_pred(pred)
 ```
 
 ```{r}
-plot_pred(pred, 4)
+stats(data_xts[val_index:(val_index+144*npred-1)], pred[(nrow(pred)-144*npred+1):nrow(pred)])
+```
+
+### Machine Learning
+
+La serie é abbastanza regolare quindi (a meno di eventi imprevedibili) le predizioni molto probabilemtne ircadono nel range dei valori passati e ne ricalcano i trend
+
+#### Mod 1
+
+```{r}
+kn <- knn_forecasting(ts(train),
+                      h = 144*npred,
+                      lags = 1:(144*7),
+                      #k = 2,
+                      msas = "MIMO",# cf = "median",
+                      transform = "multiplicative")
+#kn
+```
+
+```{r}
+knn <- xts(kn$prediction, index(val))
+plot_pred(knn)
+```
+
+```{r}
+stats(val, knn)
+```
+
+#### Mod 2
+
+```{r}
+kn <- knn_forecasting(ts(train),
+                      h = 144*npred,
+                      lags = 1:(144),
+                      #k = 2,
+                      msas = "MIMO",# cf = "median",
+                      transform = "multiplicative")
+```
+
+```{r}
+knn <- xts(kn$prediction, index(val))
+plot_pred(knn)
+```
+
+```{r}
+stats(val, knn)
+```
+
+## Data prediction
+
+```{r}
+train_gen_nov <- data_xts_complete[1:(val_index+144*npred-1),]
+```
+
+```{r}
+dic_arima <- forecast(Arima(),
+                      h = 144*npred)
+```
+
+```{r}
+dic_ucm <- forecast(ucm(),
+                    h = 144*npred)
+```
+
+```{r}
+dic_ml <- knn_forecasting(ts(train_gen_nov),
+                      h = 144*npred,
+                      lags = 1:(144*7),
+                      k = 2,
+                      msas = "MIMO", cf = "median",
+                      transform = "multiplicative")
+dic_ml_pred <- xts(dic_ml$prediction, index(test))
+```
+
+```{r}
+results <- data.frame(arima = dic_arima_pred,
+                      ucm = dic_ucm_pred,
+                      ml = dic_ml_pred)
+rownames(results) <- index(test)
+```
+
+```{r}
+write.csv(results, "886725_20221224.csv", row.names=TRUE) # cambiare data e verificare row.names
 ```
