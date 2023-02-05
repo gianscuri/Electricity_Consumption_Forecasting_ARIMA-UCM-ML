@@ -7,14 +7,16 @@ output: html_document
 
 # Time series forecast
 
-## Setup and loading dataset
+## 0. Import
+
+### Setup and useful functions
 
 ```{r}
 set.seed(100)
 
 Sys.setenv(TZ='GMT') # imposto la time zone
 
-packages <- c("forecast", "KFAS", "xts", "fastDummies", "tsfknn") # librerie
+packages <- c("forecast", "KFAS", "xts", "fastDummies", "tsfknn", "MASS") # librerie
 
 installed_packages <- packages %in% rownames(installed.packages())
 if (any(installed_packages == FALSE)) {
@@ -30,8 +32,8 @@ stats <- function(actual,pred){
   rmse <- sqrt(mean((actual - pred)^2))
   mape <- mean(abs((actual - pred)/actual))*100
   mae <- mean(abs(actual - pred))
-  cat("RMSE", rmse, "\nMAPE", mape, "\nMAE ", mae)
-  #return(c(rmse, mape, mae))
+  cat("RMSE", rmse, "\nMAPE", mape, "\nMAE ", mae, "\n")
+  return(c(rmse, mape, mae))
 }
 
 # Significativitá regressori
@@ -40,8 +42,6 @@ pars_test <- function(coef, var_coef){
   return(test)
 }
 ```
-
-Funzione per plottare le predizioni
 
 ```{r}
 plot_pred <- function(pred, days=3){
@@ -54,14 +54,14 @@ plot_pred <- function(pred, days=3){
 }
 ```
 
+### Loading data
+
 ```{r}
 working_dir = dirname(rstudioapi::getSourceEditorContext()$path)
 setwd(working_dir)
 
 data <- read.csv("data2022_train.csv", colClasses=c("character", "numeric"))
 ```
-
-### Trasformazione in serie storica XTS
 
 ```{r}
 data_xts <- xts(data$y, as.POSIXct(data$X, format="%Y-%m-%d %H:%M:%S", tz="GMT"))
@@ -71,58 +71,67 @@ data_xts <- xts(data$y, as.POSIXct(data$X, format="%Y-%m-%d %H:%M:%S", tz="GMT")
 periodicity(data_xts)
 ```
 
-## Data Exploration
+## 1. Data Exploration
 
 ```{r}
 summary(data_xts)
 ```
 
-```{r}
-tsdisplay(train)
-```
+### Plot time series
 
 ```{r}
 plot(data_xts)
+plot(apply.weekly(data_xts,FUN=mean))
+plot(apply.monthly(data_xts,FUN=mean))
+autoplot(mstl(data_xts))
 ```
 
 ```{r}
-plot(aggregate(data_xts, month, mean))
-```
-
-```{r}
-plot(data_xts[seq(1, nrow(data), 144)])
 plot(data_xts[1:144])
 plot(data_xts[1:144*21])
 ```
 
-```{r}
-autoplot(mstl(data_xts))
-```
-
-### Dipendenza in varianza
+### Box-Cox transformation
 
 ```{r}
 med <- tapply(data_xts, rep(1:334, each = 144), mean)
 sds <- tapply(data_xts, rep(1:334, each = 144), sd)
-plot(med, sds)
+plot(med, sds) # 334 dots -> one for each day
 ```
 
-Forse é meglio lavorare con i logaritmi
+```{r}
+bc <- boxcox(sds ~ med)
+lambda <- bc$x[which.max(bc$y)]
+lambda
+```
+
+```{r}
+data_xts_bc <- (data_xts^lambda - 1) / lambda
+
+med_bc <- tapply(data_xts_bc, rep(1:334, each = 144), mean)
+sds_bc <- tapply(data_xts_bc, rep(1:334, each = 144), sd)
+```
+
+```{r}
+plot(med_bc, sds_bc) # 334 dots -> one for each day
+plot(med, sds) # 334 dots -> one for each day
+plot(data_xts_bc)
+```
 
 ### Detecting outliers
 
 ```{r}
 plot(diff(data_xts,1))
+plot(diff(data_xts_bc,1))
 data_xts[diff(data_xts,1) < -5000 | diff(data_xts,1) > 5000] #|> index() |> as.Date()
 ```
 
 ```{r}
 par(mfrow=c(2,2))
-plot(data_xts["2017-01-14"])
-#plot(train["2017-01-15"])
-plot(data_xts["2017-03-28"])
-plot(data_xts["2017-04-20"])
-plot(data_xts["2017-05-31"])
+plot(data_xts["2017-01-14"], ylim=c(15000,50000), main='', yaxis.right = FALSE, major.ticks = "days", col="red")
+plot(data_xts["2017-03-28"], ylim=c(15000,50000), main='', yaxis.right = FALSE, major.ticks = "days", col="red")
+plot(data_xts["2017-04-20"], ylim=c(15000,50000), main='', yaxis.right = FALSE, major.ticks = "days", col="red")
+plot(data_xts["2017-05-31"], ylim=c(15000,50000), main='', yaxis.right = FALSE, major.ticks = "days", col="red")
 ```
 
 ### Train, validation e test set
@@ -152,7 +161,12 @@ test <- data_xts_complete[test_index:nrow(data_xts_complete)]
 cat(paste0("small: ", nrow(small), "\ntrain: ", nrow(train), "\nval:   ", nrow(val), "\ntest:  ", nrow(test)))
 ```
 
-## Data Modeling
+## 2. Data Modeling
+
+```{r}
+stats_results <- data.frame(matrix(nrow=0,ncol=4))
+colnames(stats_results)<-c("Model", "RMSE", "MAPE", "MAE")
+```
 
 ### ARIMA Models
 
@@ -166,15 +180,19 @@ cat(paste0("small: ", nrow(small), "\ntrain: ", nrow(train), "\nval:   ", nrow(v
 
     -   144 modelli per togliere stagionalita giornaliera
 
+-   Possibilita 3
+
+    -   24 modelli per togliere la stagionalita giornaliera usando la media dell'ora
+
 ```{r}
-train_dummy <- fastDummies::dummy_cols(format(index(train), "%u"), remove_selected_columns = TRUE, remove_first_dummy = TRUE)
+train_dummy <- fastDummies::dummy_cols(format(index(train), "%u"), remove_selected_columns = TRUE, remove_first_dummy = FALSE)
 rownames(train_dummy) <- index(train)
-colnames(train_dummy) <- c("mart", "merc", "giov", "ven", "sab", "dom")
+colnames(train_dummy) <- c("lun", "mart", "merc", "giov", "ven", "sab", "dom")
 train_dummy <- as.matrix(train_dummy)
 
-val_dummy <- fastDummies::dummy_cols(format(index(val), "%u"), remove_selected_columns = TRUE, remove_first_dummy = TRUE)
+val_dummy <- fastDummies::dummy_cols(format(index(val), "%u"), remove_selected_columns = TRUE, remove_first_dummy = FALSE)
 rownames(val_dummy) <- index(val)
-colnames(val_dummy) <- c("mart", "merc", "giov", "ven", "sab", "dom")
+colnames(val_dummy) <- c("lun", "mart", "merc", "giov", "ven", "sab", "dom")
 val_dummy <- as.matrix(val_dummy)
 
 #train_arima <- cbind(train, train_dummy)
@@ -192,7 +210,7 @@ train |> #[42000:length(train)]
   #diff() |>
   diff() |>
   #diff(144*7) |>
-  #diff(144) |>
+  diff(144) |>
   #autoplot()
   Acf(300)
 #train[diff(diff(train, 144), 1) < -4000]
@@ -201,7 +219,7 @@ train |> #[42000:length(train)]
 ```{r}
 train |> Pacf(300)
 train |>
-  #diff(144) |>
+  diff(144) |>
   diff() |>
   Pacf(300)
 ```
@@ -213,114 +231,202 @@ nsdiffs(train)
 #### Mod 1
 
 ```{r}
-mod1 <- Arima(y = ts(train[(length(train)-144*14):length(train)]), # subset del train
-              order = c(0, 1, 1),
-              list(order = c(0, 1, 1), period = 144), # gli specifichiamo la frequenza
-              #xreg = dummy_week,
-              include.constant = TRUE)
-summary(mod1)
+#train <- (train^lambda - 1) / lambda
+#data_xts <- (data_xts^lambda - 1) / lambda
 ```
 
 ```{r}
-#mod1.plot_diagnostics(figsize=c(7,5))
+arima_mod1 <- function(train) {
+  Arima(y = ts(train, freq = 144),
+              order = c(0, 0, 0),
+              seasonal = c(0, 1, 1),
+              include.constant = FALSE)}
+arima_mod1_train <- arima_mod1(train)
+summary(arima_mod1_train)
+```
+
+```{r}
+#arima_mod1.plot_diagnostics(figsize=c(7,5))
 #plt.show()
 ```
 
 ```{r}
-# plot(index(mod1$residuals)/600/144, mod1$residuals, type='l', xlab='Day', ylab='Residual')
+# plot(index(arima_mod1$residuals)/600/144, arima_mod1$residuals, type='l', xlab='Day', ylab='Residual')
 ```
 
 ```{r}
-pred <- forecast(mod1, 144*npred)
-plot(pred)
+arima_pred1 <- forecast(arima_mod1_train, 144*npred)
+plot(arima_pred1)
 #abline(v=val_index*600)
+
+arima_pred1 <- xts(arima_pred1$mean, index(val))
 ```
 
 ```{r}
-pred <- xts(pred$mean, index(val))
-```
+plot_pred(arima_pred1)
 
-```{r}
-plot_pred(pred)
-```
-
-```{r}
-stats(val, pred)
+stats_results[nrow(stats_results) + 1,] <- c("arima_mod1", stats(val, arima_pred1))
 ```
 
 #### Mod 2
 
 ```{r}
-mod2 <- Arima(y = ts(small[(length(small)-14*144):length(small)]), # subset del train
+arima_mod2 <- function(train) {
+  Arima(y = ts(train, freq = 144),
               order = c(0, 1, 1),
-              list(order = c(0, 1, 1), period = 144), # gli specifichiamo la frequenza
-              #xreg = dummy_week,
-              include.constant = TRUE)
-summary(mod2)
+              seasonal = c(0, 1, 1),
+              include.constant = FALSE)}
+arima_mod2_train <- arima_mod2(train)
+summary(arima_mod2_train)
 ```
 
 ```{r}
-pred2 <- forecast(mod2, 144*npred, xreg=val_dummy)
-plot(pred2)
+arima_pred2 <- forecast(arima_mod2_train, 144*npred)
+plot(arima_pred2)
 abline(v=val_index*600)
+
+arima_pred2 <- xts(arima_pred2$mean, index(val))
 ```
 
 ```{r}
-pred2 <- xts(pred2$mean, index(val))
-```
+plot_pred(arima_pred2)
 
-```{r}
-plot_pred(pred2)
-```
-
-```{r}
-stats(val, pred2)
+stats_results[nrow(stats_results) + 1,] <- c("arima_mod2", stats(val, arima_pred2))
 ```
 
 #### Mod 3
 
 ```{r}
-mod3 <- auto.arima(ts(small, frequency = 144),
-                   stepwise = TRUE,
-                   approximation = TRUE,
-                   xreg = dummy_week[small_index:nrow(dummy_week),]) # Minimizza AIC
-mod3
-```
-
-```{r}
-mod3 <- Arima(y = ts(small[(length(small)-14*144):length(small)]), # subset del train
+arima_mod3 <- function(train) {
+  Arima(y = ts(train, freq = 144),
               order = c(2, 1, 0),
-              list(order = c(0, 1, 1), period = 144), # gli specifichiamo la frequenza
-              #xreg = dummy_week,
-              include.constant = TRUE)
-mod3
+              seasonal = c(0, 1, 1),
+              include.constant = FALSE)}
+arima_mod3_train <- arima_mod3(train)
+summary(arima_mod3_train)
 ```
 
-ARIMA(2,1,0)(0,1,0)[144]
-
 ```{r}
-pred3 <- forecast(mod3,
+arima_pred3 <- forecast(arima_mod3_train,
                   144*npred)
-                  #xreg = val_dummy)
-plot(pred3)
+plot(arima_pred3)
 abline(v=val_index*600)
+
+arima_pred3 <- xts(arima_pred3$mean, index(val))
 ```
 
 ```{r}
-pred3 <- xts(pred3$mean, index(val))
-plot_pred(pred3)
+plot_pred(arima_pred3)
+
+stats_results[nrow(stats_results) + 1,] <- c("arima_mod3", stats(val, arima_pred3))
+```
+
+#### Mod 4
+
+```{r}
+arima_mod4 <- function(train) {
+  Arima(y = ts(train, freq = 144),
+              order = c(0, 0, 0),
+              seasonal = c(1, 0, 0),
+              xreg = train_dummy,
+              include.constant = FALSE)}
+arima_mod4_train <- arima_mod4(train)
+summary(arima_mod4_train)
 ```
 
 ```{r}
-o <- Arima(ts(small, frequency = 144),
-           order = c(1, 0, 0),
-           seasonal = list(order = c(0, 1, 2)))
-pred3 <- forecast(o, h = 144*npred)
+arima_pred4 <- forecast(arima_mod4_train,
+                  144*npred,
+                  xreg = val_dummy)
+plot(arima_pred4)
+abline(v=val_index*600)
+
+arima_pred4 <- xts(arima_pred4$mean, index(val))
 ```
 
 ```{r}
-pred3 <- xts(pred3$mean, index(val))
-plot_pred(pred3)
+plot_pred(arima_pred4)
+stats_results[nrow(stats_results) + 1,] <- c("arima_mod4", stats(val, arima_pred4))
+```
+
+#### Mod 5: possibilita 2
+
+```{r}
+train_meanhour <- period.apply(train, endpoints(train, "hours"), mean)
+index(train_meanhour) <- index(train_meanhour)-600*2
+
+train_byhour <- vector('list', 24)
+for (hour in 1:24) {
+  train_byhour[[hour]] <- train_meanhour[seq(hour, length(train_meanhour), 24)]
+  }
+```
+
+```{r}
+val_meanhour <- period.apply(val, endpoints(val, "hours"), mean)
+index(val_meanhour) <- index(val_meanhour)-600*2
+
+val_byhour <- vector('list', 24)
+for (hour in 1:24) {
+  val_byhour[[hour]] <- val_meanhour[seq(hour, length(val_meanhour), 24)] # to obtain the index
+  }
+```
+
+```{r}
+plot(train_byhour[[9]])
+
+train_byhour[[9]] |> diff() |> Pacf()
+```
+
+```{r}
+arima_mod5_byhour <- vector('list', 24)
+for (hour in 1:24) {
+  arima_mod5_byhour[[hour]] <- Arima(y = ts(train_byhour[[hour]], freq = 7),
+                              order = c(0, 1, 1),
+                              seasonal = c(0, 1, 1),
+                              include.constant = FALSE
+                              )
+  }
+```
+
+```{r}
+# auto arima
+# mod5_byhour <- vector('list', 24)
+# for (hour in 1:24) {
+#   print(hour)
+#   mod5_byhour[[hour]] <- auto.arima(y = ts(train_byhour[[hour]], freq = 7),
+#                                     )
+#   }
+```
+
+```{r}
+arima_pred5_byhour <- vector('list', 24)
+for (hour in 1:24) {
+  arima_pred5_byhour[[hour]] <- forecast(arima_mod5_byhour[[hour]], npred)
+  arima_pred5_byhour[[hour]] <- xts(arima_pred5_byhour[[hour]]$mean, index(val_byhour[[hour]]))
+}
+
+arima_pred5_merged <- do.call(rbind, arima_pred5_byhour) # concatenate the predictions
+```
+
+```{r}
+temp <- xts(rep(as.numeric(NA), length(val)), index(val))
+arima_pred5 <- merge(temp, arima_pred5_merged)$arima_pred5_merged
+arima_pred5 <- na.approx(arima_pred5, na.rm = FALSE)
+arima_pred5 <- na.locf(arima_pred5, na.rm = FALSE)
+arima_pred5 <- na.locf(arima_pred5, fromLast = TRUE)
+```
+
+```{r}
+arima_stats5_byhour <- vector('list', 24)
+for (hour in 1:24) {
+  arima_stats5_byhour[[hour]] <- stats(arima_pred5_byhour[[hour]], val_byhour[[hour]])[[3]]
+}
+plot(unlist(arima_stats5_byhour), type='l', ylab = 'MAE', xlab = 'Hour')
+```
+
+```{r}
+plot_pred(val, arima_pred5)
+stats_results[nrow(stats_results) + 1,] <- c("arima_mod5", stats(val, arima_pred5))
 ```
 
 ### UCM Models
@@ -336,7 +442,7 @@ small_ucm <- c(small, xts(rep(as.numeric(NA), length(tseq)), tseq)) # aggiungo N
 #### Mod 1
 
 ```{r}
-ucm_pre <- function(train) {
+ucm_mod1 <- function(train) {
   # Definizione del modello
   mod <- SSModel(V1~SSMtrend(2, list(NA, NA))+
                     SSMseasonal(144, NA, "trigonometric", harmonics = 1:2)+
@@ -387,21 +493,20 @@ ucm_pre <- function(train) {
 ```
 
 ```{r}
-pred <- ucm_pre(train_ucm)
+ucm_pred1 <- ucm_mod1(train_ucm)
 ```
 
 ```{r}
-plot_pred(pred)
-```
+plot_pred(ucm_pred1)
 
-```{r}
-stats(data_xts[val_index:(val_index+144*npred-1)], pred[(nrow(pred)-144*npred+1):nrow(pred)])
+ucm_stats1 <- stats(data_xts[val_index:(val_index+144*npred-1)], ucm_pred1[(nrow(ucm_pred1)-144*npred+1):nrow(ucm_pred1)])
+stats_results[nrow(stats_results) + 1,] <- c("ucm_mod1", ucm_stats1)
 ```
 
 #### Mod 2
 
 ```{r}
-ucm_pre <- function(train) {
+ucm_mod2 <- function(train) {
   arm144 <- 10
   arm1008 <- 1
   # Definizione del modello
@@ -454,15 +559,14 @@ ucm_pre <- function(train) {
 ```
 
 ```{r}
-pred <- ucm_pre(train_ucm)
+ucm_pred2 <- ucm_mod2(train_ucm)
 ```
 
 ```{r}
-plot_pred(pred)
-```
+plot_pred(ucm_pred2)
 
-```{r}
-stats(data_xts[val_index:(val_index+144*npred-1)], pred[(nrow(pred)-144*npred+1):nrow(pred)])
+ucm_stats2 <- stats(data_xts[val_index:(val_index+144*npred-1)], ucm_pred2[(nrow(ucm_pred2)-144*npred+1):nrow(ucm_pred2)])
+stats_results[nrow(stats_results) + 1,] <- c("ucm_mod2", ucm_stats2)
 ```
 
 Minimo
@@ -474,7 +578,7 @@ Minimo
 #### Mod 3
 
 ```{r}
-ucm_pre <- function(train) {
+ucm_mod3 <- function(train) {
   arm144 <- 10
   arm1008 <- 1
   # Definizione del modello
@@ -527,15 +631,14 @@ ucm_pre <- function(train) {
 ```
 
 ```{r}
-pred <- ucm_pre(small_ucm) # fare predizioni su 
+ucm_pred3 <- ucm_mod3(train_ucm) # fare predizioni su 
 ```
 
 ```{r}
-plot_pred(pred)
-```
+plot_pred(ucm_pred3)
 
-```{r}
-stats(data_xts[val_index:(val_index+144*npred-1)], pred[(nrow(pred)-144*npred+1):nrow(pred)])
+ucm_stats3 <- stats(data_xts[val_index:(val_index+144*npred-1)], ucm_pred3[(nrow(ucm_pred3)-144*npred+1):nrow(ucm_pred3)])
+stats_results[nrow(stats_results) + 1,] <- c("ucm_mod3", ucm_stats3)
 ```
 
 ### Machine Learning
@@ -545,77 +648,95 @@ La serie é abbastanza regolare quindi (a meno di eventi imprevedibili) le predi
 #### Mod 1
 
 ```{r}
-kn <- knn_forecasting(ts(train),
+ml_mod1 <- function(train){
+  knn_forecasting(ts(train),
                       h = 144*npred,
                       lags = 1:(144*7),
                       #k = 2,
                       msas = "MIMO",# cf = "median",
-                      transform = "multiplicative")
-#kn
+                      transform = "multiplicative")}
 ```
 
 ```{r}
-knn <- xts(kn$prediction, index(val))
-plot_pred(knn)
+ml_pred1 <- ml_mod1(train)
+ml_pred1 <- xts(ml_pred1$prediction, index(val))
 ```
 
 ```{r}
-stats(val, knn)
+plot_pred(ml_pred1)
+
+stats_results[nrow(stats_results) + 1,] <- c("ml_mod1", stats(val, ml_pred1))
 ```
 
 #### Mod 2
 
 ```{r}
-kn <- knn_forecasting(ts(train),
+ml_mod2 <- function(train){
+  knn_forecasting(ts(train),
                       h = 144*npred,
                       lags = 1:(144),
                       #k = 2,
                       msas = "MIMO",# cf = "median",
-                      transform = "multiplicative")
+                      transform = "multiplicative")}
 ```
 
 ```{r}
-knn <- xts(kn$prediction, index(val))
-plot_pred(knn)
+ml_pred2 <- ml_mod2(train)
+ml_pred2 <- xts(ml_pred2$prediction, index(val))
 ```
 
 ```{r}
-stats(val, knn)
+plot_pred(ml_pred2)
+stats_results[nrow(stats_results) + 1,] <- c("ml_mod2", stats(val, ml_pred2))
 ```
 
-## Data prediction
+## 3. Data prediction
 
 ```{r}
 train_gen_nov <- data_xts_complete[1:(val_index+144*npred-1),]
+
+tseq <- seq(from = index(train_gen_nov[nrow(train_gen_nov),])+600, length.out = 144*npred, by = 600)
+train_gen_nov_ucm <- c(train_gen_nov, xts(rep(as.numeric(NA), length(tseq)), tseq)) # aggiungo NA a train
 ```
 
 ```{r}
-dic_arima <- forecast(Arima(),
-                      h = 144*npred)
+stats_results
 ```
 
-```{r}
-dic_ucm <- forecast(ucm(),
-                    h = 144*npred)
-```
+#### ARIMA
 
 ```{r}
-dic_ml <- knn_forecasting(ts(train_gen_nov),
-                      h = 144*npred,
-                      lags = 1:(144*7),
-                      k = 2,
-                      msas = "MIMO", cf = "median",
-                      transform = "multiplicative")
+dic_arima_train <- arima_mod1(train_gen_nov)
+
+dic_arima_pred <- forecast(dic_arima_train, 144*npred)
+dic_arima_pred <- xts(dic_arima_pred$mean, index(val))
+```
+
+#### UCM
+
+```{r}
+dic_ucm <- ucm_mod1(train_gen_nov_ucm) # modello 1
+
+dic_ucm_pred <- dic_ucm[(nrow(dic_ucm)-144*npred+1):nrow(dic_ucm)]
+```
+
+#### ML
+
+```{r}
+dic_ml <- ml_mod1(train_gen_nov) # modello 1
+
 dic_ml_pred <- xts(dic_ml$prediction, index(test))
 ```
 
+#### Results
+
 ```{r}
-results <- data.frame(arima = dic_arima_pred,
-                      ucm = dic_ucm_pred,
-                      ml = dic_ml_pred)
+results <- data.frame(ARIMA = dic_arima_pred,
+                      UCM = dic_ucm_pred,
+                      ML = dic_ml_pred)
 rownames(results) <- index(test)
 ```
 
 ```{r}
-write.csv(results, "886725_20221224.csv", row.names=TRUE) # cambiare data e verificare row.names
+# write.csv(results, "886725_20221224.csv", row.names=TRUE) # cambiare data e verificare row.names
 ```
