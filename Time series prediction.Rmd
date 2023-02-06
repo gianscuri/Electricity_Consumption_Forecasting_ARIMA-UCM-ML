@@ -2,7 +2,9 @@
 title: "Data Exploration"
 author: "Gianluca Scuri"
 date: "2022-12-11"
-output: html_document
+output:
+  pdf_document: default
+  html_document: default
 ---
 
 # Time series forecast
@@ -185,14 +187,14 @@ colnames(stats_results)<-c("Model", "RMSE", "MAPE", "MAE")
     -   24 modelli per togliere la stagionalita giornaliera usando la media dell'ora
 
 ```{r}
-train_dummy <- fastDummies::dummy_cols(format(index(train), "%u"), remove_selected_columns = TRUE, remove_first_dummy = FALSE)
+train_dummy <- fastDummies::dummy_cols(format(index(train), "%u"), remove_selected_columns = TRUE, remove_first_dummy = TRUE)
 rownames(train_dummy) <- index(train)
-colnames(train_dummy) <- c("lun", "mart", "merc", "giov", "ven", "sab", "dom")
+colnames(train_dummy) <- c("mart", "merc", "giov", "ven", "sab", "dom")
 train_dummy <- as.matrix(train_dummy)
 
-val_dummy <- fastDummies::dummy_cols(format(index(val), "%u"), remove_selected_columns = TRUE, remove_first_dummy = FALSE)
+val_dummy <- fastDummies::dummy_cols(format(index(val), "%u"), remove_selected_columns = TRUE, remove_first_dummy = TRUE)
 rownames(val_dummy) <- index(val)
-colnames(val_dummy) <- c("lun", "mart", "merc", "giov", "ven", "sab", "dom")
+colnames(val_dummy) <- c("mart", "merc", "giov", "ven", "sab", "dom")
 val_dummy <- as.matrix(val_dummy)
 
 #train_arima <- cbind(train, train_dummy)
@@ -324,13 +326,13 @@ stats_results[nrow(stats_results) + 1,] <- c("arima_mod3", stats(val, arima_pred
 #### Mod 4
 
 ```{r}
-arima_mod4 <- function(train) {
+arima_mod4 <- function(train, train_dummy) {
   Arima(y = ts(train, freq = 144),
               order = c(0, 0, 0),
               seasonal = c(1, 0, 0),
               xreg = train_dummy,
               include.constant = FALSE)}
-arima_mod4_train <- arima_mod4(train)
+arima_mod4_train <- arima_mod4(train, train_dummy)
 summary(arima_mod4_train)
 ```
 
@@ -349,7 +351,7 @@ plot_pred(arima_pred4)
 stats_results[nrow(stats_results) + 1,] <- c("arima_mod4", stats(val, arima_pred4))
 ```
 
-#### Mod 5: possibilita 2
+#### Mod 5
 
 ```{r}
 train_meanhour <- period.apply(train, endpoints(train, "hours"), mean)
@@ -414,6 +416,7 @@ arima_pred5 <- merge(temp, arima_pred5_merged)$arima_pred5_merged
 arima_pred5 <- na.approx(arima_pred5, na.rm = FALSE)
 arima_pred5 <- na.locf(arima_pred5, na.rm = FALSE)
 arima_pred5 <- na.locf(arima_pred5, fromLast = TRUE)
+names(arima_pred5) <- "V1"
 ```
 
 ```{r}
@@ -425,7 +428,7 @@ plot(unlist(arima_stats5_byhour), type='l', ylab = 'MAE', xlab = 'Hour')
 ```
 
 ```{r}
-plot_pred(val, arima_pred5)
+plot_pred(arima_pred5)
 stats_results[nrow(stats_results) + 1,] <- c("arima_mod5", stats(val, arima_pred5))
 ```
 
@@ -695,6 +698,18 @@ stats_results[nrow(stats_results) + 1,] <- c("ml_mod2", stats(val, ml_pred2))
 ```{r}
 train_gen_nov <- data_xts_complete[1:(val_index+144*npred-1),]
 
+# arima train
+train_gen_nov_dummy <- fastDummies::dummy_cols(format(index(train_gen_nov), "%u"), remove_selected_columns = TRUE, remove_first_dummy = TRUE)
+rownames(train_gen_nov_dummy) <- index(train_gen_nov)
+colnames(train_gen_nov_dummy) <- c("mart", "merc", "giov", "ven", "sab", "dom")
+train_gen_nov_dummy <- as.matrix(train_gen_nov_dummy)
+
+test_gen_nov_dummy <- fastDummies::dummy_cols(format(index(test), "%u"), remove_selected_columns = TRUE, remove_first_dummy = TRUE)
+rownames(test_gen_nov_dummy) <- index(test)
+colnames(test_gen_nov_dummy) <- c("mart", "merc", "giov", "ven", "sab", "dom")
+test_gen_nov_dummy <- as.matrix(test_gen_nov_dummy)
+
+# ucm train
 tseq <- seq(from = index(train_gen_nov[nrow(train_gen_nov),])+600, length.out = 144*npred, by = 600)
 train_gen_nov_ucm <- c(train_gen_nov, xts(rep(as.numeric(NA), length(tseq)), tseq)) # aggiungo NA a train
 ```
@@ -706,16 +721,16 @@ stats_results
 #### ARIMA
 
 ```{r}
-dic_arima_train <- arima_mod1(train_gen_nov)
+dic_arima_train <- arima_mod4(train_gen_nov, train_gen_nov_dummy)
 
-dic_arima_pred <- forecast(dic_arima_train, 144*npred)
+dic_arima_pred <- forecast(dic_arima_train, 144*npred, xreg=test_gen_nov_dummy)
 dic_arima_pred <- xts(dic_arima_pred$mean, index(val))
 ```
 
 #### UCM
 
 ```{r}
-dic_ucm <- ucm_mod1(train_gen_nov_ucm) # modello 1
+dic_ucm <- ucm_mod2(train_gen_nov_ucm) # modello 1
 
 dic_ucm_pred <- dic_ucm[(nrow(dic_ucm)-144*npred+1):nrow(dic_ucm)]
 ```
@@ -723,20 +738,30 @@ dic_ucm_pred <- dic_ucm[(nrow(dic_ucm)-144*npred+1):nrow(dic_ucm)]
 #### ML
 
 ```{r}
-dic_ml <- ml_mod1(train_gen_nov) # modello 1
+dic_ml <- ml_mod1(train_gen_nov)$prediction # modello 1
 
-dic_ml_pred <- xts(dic_ml$prediction, index(test))
+dic_ml_pred <- xts(dic_ml, index(test))
 ```
 
 #### Results
 
 ```{r}
-results <- data.frame(ARIMA = dic_arima_pred,
+results <- data.frame(date = index(test),
+                      ARIMA = dic_arima_pred,
                       UCM = dic_ucm_pred,
                       ML = dic_ml_pred)
-rownames(results) <- index(test)
 ```
 
 ```{r}
-# write.csv(results, "886725_20221224.csv", row.names=TRUE) # cambiare data e verificare row.names
+plot(results$ARIMA, type='l', col='red', lwd=2.5)
+lines(results$UCM, col='blue', lwd=2.5)
+lines(results$ML, col='green', lwd=2.5)
+
+plot(results$ARIMA[(144*25):nrow(results)], type='l', col='red', lwd=2.5, ylim = c(20000, 43000))
+lines(results$UCM[(144*25):nrow(results)], col='blue', lwd=2.5)
+lines(results$ML[(144*25):nrow(results)], col='green', lwd=2.5)
+```
+
+```{r}
+write.csv(results, "886725_20230205.csv", row.names=FALSE) # cambiare data
 ```
