@@ -18,7 +18,7 @@ set.seed(100)
 
 Sys.setenv(TZ='GMT') # imposto la time zone
 
-packages <- c("forecast", "KFAS", "xts", "fastDummies", "tsfknn", "MASS") # librerie
+packages <- c("forecast", "KFAS", "xts", "fastDummies", "tsfknn", "MASS", "tidyr", "ggplot2") # librerie
 
 installed_packages <- packages %in% rownames(installed.packages())
 if (any(installed_packages == FALSE)) {
@@ -273,19 +273,22 @@ stats_results[nrow(stats_results) + 1,] <- c("arima_mod1", stats(val, arima_pred
 #### Mod 2
 
 ```{r}
-arima_mod2 <- function(train) {
-  Arima(y = ts(train, freq = 144),
-              order = c(0, 1, 1),
-              seasonal = c(0, 1, 1),
-              include.constant = FALSE)}
+arima_mod2 <- function(train){
+  auto.arima(y = ts(train, freq = 144))
+}
+
+#arima_mod2 <- function(train) {
+#  Arima(y = ts(train, freq = 144),
+#              order = c(0, 1, 1),
+#              seasonal = c(0, 1, 1),
+#              include.constant = FALSE)}
 arima_mod2_train <- arima_mod2(train)
 summary(arima_mod2_train)
 ```
 
 ```{r}
 arima_pred2 <- forecast(arima_mod2_train, 144*npred)
-plot(arima_pred2)
-abline(v=val_index*600)
+plot(arima_pred2, include)
 
 arima_pred2 <- xts(arima_pred2$mean, index(val))
 ```
@@ -753,13 +756,15 @@ results <- data.frame(date = index(test),
 ```
 
 ```{r}
-plot(results$ARIMA, type='l', col='red', lwd=2.5)
-lines(results$UCM, col='blue', lwd=2.5)
-lines(results$ML, col='green', lwd=2.5)
+df <- gather(results, Model, Values, ARIMA:ML)
 
-plot(results$ARIMA[(144*25):nrow(results)], type='l', col='red', lwd=2.5, ylim = c(20000, 43000))
-lines(results$UCM[(144*25):nrow(results)], col='blue', lwd=2.5)
-lines(results$ML[(144*25):nrow(results)], col='green', lwd=2.5)
+p <- ggplot(data = df, aes(x=date, y=Values)) +
+  geom_line(aes(color = Model), size = 0.5) +
+  theme_minimal() +
+  labs(x = NULL, y = "Power", title = "December forecasts comparison")
+p
+
+ggsave('plots/december_forecasts_comparison.jpg', p, height = 3 , width = 3 * 4)
 ```
 
 ```{r}
