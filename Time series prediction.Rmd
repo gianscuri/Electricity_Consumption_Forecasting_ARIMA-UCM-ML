@@ -18,7 +18,7 @@ set.seed(100)
 
 Sys.setenv(TZ='GMT') # imposto la time zone
 
-packages <- c("forecast", "KFAS", "xts", "fastDummies", "tsfknn", "MASS", "tidyr", "ggplot2") # librerie
+packages <- c("forecast", "KFAS", "xts", "fastDummies", "tsfknn", "MASS", "tidyr", "ggplot2", "lubridate", "randomForest", "ranger", "tibble") # librerie
 
 installed_packages <- packages %in% rownames(installed.packages())
 if (any(installed_packages == FALSE)) {
@@ -56,6 +56,10 @@ plot_pred <- function(pred, days=3){
 }
 ```
 
+```{r}
+theme_new <- theme_set(theme_light())
+```
+
 ### Loading data
 
 ```{r}
@@ -85,12 +89,19 @@ summary(data_xts)
 plot(data_xts)
 plot(apply.weekly(data_xts,FUN=mean))
 plot(apply.monthly(data_xts,FUN=mean))
-autoplot(mstl(data_xts))
+
+msts_cons <- data_xts[1:(144*60)] |> msts(seasonal.periods = c(144, 144*7))
+p <- msts_cons |> mstl() |> autoplot()
+p
+ggsave('plots/ts_decomposition.jpg', p, height = 6 , width = 11)
 ```
 
 ```{r}
 plot(data_xts[1:144])
 plot(data_xts[1:144*21])
+p <- autoplot(data_xts[1:144*7]) + xlab('Day') + ylab('Power')
+p
+ggsave('plots/one_week.jpg', p, height = 3 , width = 5)
 ```
 
 ### Box-Cox transformation
@@ -118,6 +129,16 @@ sds_bc <- tapply(data_xts_bc, rep(1:334, each = 144), sd)
 plot(med_bc, sds_bc) # 334 dots -> one for each day
 plot(med, sds) # 334 dots -> one for each day
 plot(data_xts_bc)
+
+a <- data.frame(cbind(med, sds))
+p <- ggplot(a, aes(x=med, y=sds)) + geom_point(size=0.8) + xlab('Mean') + ylab('Standard deviation')
+p
+ggsave('plots/scatter.jpg', p, height = 3 , width = 5)
+
+a <- data.frame(cbind(med_bc, sds_bc))
+p <- ggplot(a, aes(x=med_bc, y=sds_bc)) + geom_point(size=0.8) + xlab('Mean') + ylab('Standard deviation')
+p
+ggsave('plots/scatter_bc.jpg', p, height = 3 , width = 5)
 ```
 
 ### Detecting outliers
@@ -134,6 +155,10 @@ plot(data_xts["2017-01-14"], ylim=c(15000,50000), main='', yaxis.right = FALSE, 
 plot(data_xts["2017-03-28"], ylim=c(15000,50000), main='', yaxis.right = FALSE, major.ticks = "days", col="red")
 plot(data_xts["2017-04-20"], ylim=c(15000,50000), main='', yaxis.right = FALSE, major.ticks = "days", col="red")
 plot(data_xts["2017-05-31"], ylim=c(15000,50000), main='', yaxis.right = FALSE, major.ticks = "days", col="red")
+
+p <- autoplot(data_xts["2017-04-20"]) + xlab('Hour') + ylab('Power') + scale_x_datetime(date_labels =  "%H %M")
+p
+ggsave('plots/anomaly.jpg', p, height = 3 , width = 5)
 ```
 
 ### Train, validation e test set
@@ -203,7 +228,8 @@ val_dummy <- as.matrix(val_dummy)
 Stimo i parametri (p, q, d)
 
 ```{r}
-ndiffs(train)
+ndiffs(diff(train, 144))
+nsdiffs(ts(train, frequency = 144))
 ```
 
 ```{r}
@@ -216,6 +242,14 @@ train |> #[42000:length(train)]
   #autoplot()
   Acf(300)
 #train[diff(diff(train, 144), 1) < -4000]
+
+p <- autoplot(Acf(train, 150)) + xlab('Lag') + ylab('ACF') + ggtitle('')
+p
+ggsave('plots/acf.jpg', p, height = 3 , width = 5)
+
+p <- autoplot(Pacf(train, 150)) + xlab('Lag') + ylab('Partial ACF') + ggtitle('')
+p
+ggsave('plots/pacf.jpg', p, height = 3 , width = 5)
 ```
 
 ```{r}
@@ -270,11 +304,25 @@ plot_pred(arima_pred1)
 stats_results[nrow(stats_results) + 1,] <- c("arima_mod1", stats(val, arima_pred1))
 ```
 
+```{r}
+Acf(diff(arima_pred1 - val, lag.max = 100))
+```
+
 #### Mod 2
+
+auto.arima using "aic": ARIMA(3,0,0)(0,1,0)[144]
 
 ```{r}
 arima_mod2 <- function(train){
-  auto.arima(y = ts(train, freq = 144))
+  auto.arima(y = ts(train, freq = 144),
+             ic = 'aic',
+             stepwise = FALSE,
+             max.p = 2,
+             max.q = 2,
+             start.p = 0,
+             start.q = 0,
+             start.P = 0,
+             start.Q = 0,)
 }
 
 #arima_mod2 <- function(train) {
@@ -288,7 +336,7 @@ summary(arima_mod2_train)
 
 ```{r}
 arima_pred2 <- forecast(arima_mod2_train, 144*npred)
-plot(arima_pred2, include)
+plot(arima_pred2)
 
 arima_pred2 <- xts(arima_pred2$mean, index(val))
 ```
@@ -301,13 +349,27 @@ stats_results[nrow(stats_results) + 1,] <- c("arima_mod2", stats(val, arima_pred
 
 #### Mod 3
 
+auto.arima using "bic": ARIMA()()[144]
+
 ```{r}
-arima_mod3 <- function(train) {
-  Arima(y = ts(train, freq = 144),
-              order = c(2, 1, 0),
-              seasonal = c(0, 1, 1),
-              include.constant = FALSE)}
-arima_mod3_train <- arima_mod3(train)
+arima_mod3 <- function(train, train_dummy){
+  auto.arima(y = ts(train, freq = 144),
+             ic = 'aic',
+             stepwise = FALSE,
+             max.p = 2,
+             max.q = 2,
+             start.p = 0,
+             start.q = 0,
+             start.P = 0,
+             start.Q = 0,
+             xreg = train_dummy)
+}
+
+# arima_mod3 <- function(train, train_dummy) {
+#   auto.arima(y = ts(train, freq = 144),
+#              #xreg = train_dummy)
+#              ic = 'bic')}
+arima_mod3_train <- arima_mod3(train, train_dummy)
 summary(arima_mod3_train)
 ```
 
@@ -352,6 +414,18 @@ arima_pred4 <- xts(arima_pred4$mean, index(val))
 ```{r}
 plot_pred(arima_pred4)
 stats_results[nrow(stats_results) + 1,] <- c("arima_mod4", stats(val, arima_pred4))
+
+df_plot_pred <- merge.xts(ground_truth = data_xts[(val_index-144*4):nrow(data_xts),], pred = arima_pred4)
+df_plot_pred <- data.frame(df_plot_pred, date=index(df_plot_pred))
+
+p <- ggplot() + 
+  geom_line(data = df_plot_pred, aes(x = date, y = ground_truth)) +
+  geom_line(data = df_plot_pred, aes(x = date, y = pred), color = "#F8766D") +
+  geom_vline(xintercept=as.numeric(df_plot_pred$date[144*4]), linetype=2) +
+  xlab('Date') +
+  ylab('Power')
+p
+ggsave('plots/arima_pred.jpg', p, height = 2 , width = 6)
 ```
 
 #### Mod 5
@@ -428,6 +502,14 @@ for (hour in 1:24) {
   arima_stats5_byhour[[hour]] <- stats(arima_pred5_byhour[[hour]], val_byhour[[hour]])[[3]]
 }
 plot(unlist(arima_stats5_byhour), type='l', ylab = 'MAE', xlab = 'Hour')
+
+
+p <- ggplot(data = data.frame(x=1:24, y=unlist(arima_stats5_byhour)), aes(x=x, y=y)) +
+  geom_point() + 
+  geom_segment( aes(x=x, xend=x, y=0, yend=y)) + xlab('Hours') + ylab('MAE')
+p
+ggsave('plots/mae_perhour.jpg', p, height = 3 , width = 5)
+  
 ```
 
 ```{r}
@@ -443,6 +525,11 @@ Definisco il train set per i modelli ucm e una versione ridotta per velocizzare 
 tseq <- seq(from = index(train[nrow(train),])+600,length.out = 144*npred,by = 600) # creo sequenza di NA a step di 10 min
 train_ucm <- c(train, xts(rep(as.numeric(NA), length(tseq)), tseq)) # aggiungo NA a train
 small_ucm <- c(small, xts(rep(as.numeric(NA), length(tseq)), tseq)) # aggiungo NA a small
+
+train_dummy_ucm <- fastDummies::dummy_cols(format(index(train_ucm), "%u"), remove_selected_columns = TRUE, remove_first_dummy = TRUE)
+rownames(train_dummy_ucm) <- index(train_ucm)
+colnames(train_dummy_ucm) <- c("mart", "merc", "giov", "ven", "sab", "dom")
+train_dummy_ucm <- as.matrix(train_dummy_ucm)
 ```
 
 #### Mod 1
@@ -540,10 +627,10 @@ ucm_mod2 <- function(train) {
   
   # funzione di update
   updt <- function(pars, model){
-    model$Q[1,1,1] <- exp(pars[1])
-    model$Q[2,2,1] <- exp(pars[2])
-    diag(model$Q[3:(2+arm144*2), 3:(2+arm144*2), 1]) <- exp(pars[3])
-    diag(model$Q[(3+arm144*2):(2+arm144*2+arm1008*2), (3+arm144*2):(2+arm144*2+arm1008*2), 1]) <- exp(pars[4])
+    model$Q[1,1,1] <- exp(pars[1]) # level
+    model$Q[2,2,1] <- exp(pars[2]) # slope
+    diag(model$Q[3:(2+arm144*2), 3:(2+arm144*2), 1]) <- exp(pars[3]) # seasonality 144
+    diag(model$Q[(3+arm144*2):(2+arm144*2+arm1008*2), (3+arm144*2):(2+arm144*2+arm1008*2), 1]) <- exp(pars[4]) # seasonality 1008
     model$H[1,1,1] <- exp(pars[5])
     model
   }
@@ -554,7 +641,7 @@ ucm_mod2 <- function(train) {
   
   # Filtro di karman - Effetua le predizioni - kfs1$muhat contiene una serie storica predetta (anche i dati di train vengono predetti)
   kfs <- KFS(fit$model,
-            smoothing = c("state", "signal", "disturbance"))
+             smoothing = c("state", "signal", "disturbance"))
   
   # conversione muhat in serie storica
   muhat <- xts(as.matrix(kfs$muhat),
@@ -573,6 +660,18 @@ plot_pred(ucm_pred2)
 
 ucm_stats2 <- stats(data_xts[val_index:(val_index+144*npred-1)], ucm_pred2[(nrow(ucm_pred2)-144*npred+1):nrow(ucm_pred2)])
 stats_results[nrow(stats_results) + 1,] <- c("ucm_mod2", ucm_stats2)
+
+df_plot_pred <- merge.xts(ground_truth = data_xts[(val_index-144*4):nrow(data_xts),], pred = ucm_pred2[val_index:nrow(data_xts),])
+df_plot_pred <- data.frame(df_plot_pred, date=index(df_plot_pred))
+
+p <- ggplot() + 
+  geom_line(data = df_plot_pred, aes(x = date, y = ground_truth)) +
+  geom_line(data = df_plot_pred, aes(x = date, y = pred), color = "#619CFF") +
+  geom_vline(xintercept=as.numeric(df_plot_pred$date[144*4]), linetype=2) +
+  xlab('Date') +
+  ylab('Power')
+p
+ggsave('plots/ucm_pred.jpg', p, height = 2 , width = 6)
 ```
 
 Minimo
@@ -584,39 +683,91 @@ Minimo
 #### Mod 3
 
 ```{r}
-ucm_mod3 <- function(train) {
+# ucm_mod3 <- function(train) {
+#   arm144 <- 10
+#   arm1008 <- 1
+#   # Definizione del modello
+#   mod <- SSModel(V1~SSMtrend(2, list(NA, NA))+
+#                     SSMseasonal(144, NA, "trigonometric", harmonics = 1:arm144)+
+#                     SSMseasonal(1008, NA, "trigonometric", harmonics = 1:arm1008),
+#                   H=NA, # Covariance matrix or array of disturbance terms ε[t] of observation equation
+#                   data=train)
+#   
+#   mod$P1inf[] <- 0 # diffuse part of P[1] (p[1] is the covariance matrix of α[1])
+#   mod$a1[1] <- mean(train[1:(144*3)]) # valore del livello iniziale (basata sulla media dei primi 3 giorni)
+#   vy <- var(log(train[1:(144)])) # varianza serie storica ((utilizzata sotto per dare un ordine di grandezza))primo giorno)
+#   diag(mod$P1) <- vy * 10 # specifichiamo che abbiamo molta incertezza sui valori che abbiamo specificato
+#   
+#   # definisco le varianze a partire da vy
+#   pars <- log(c(
+#     logVarEta = vy/100000,
+#     logVarZeta = vy/1500,
+#     logVarOm144 = vy/1,
+#     logVarOm1008 = vy/10000,
+#     logVarEps = vy/100
+#   ))
+#   
+#   # funzione di update -> imposto i valori iniziali
+#   updt <- function(pars, model){
+#     m <- arm144*2
+#     n <- arm1008*2
+#     model$Q[1,1,1] <- exp(pars[1])
+#     model$Q[2,2,1] <- exp(pars[2])
+#     diag(model$Q[3:(2+m), 3:(2+m), 1]) <- exp(pars[3])
+#     diag(model$Q[(3+m):(2+m+n), (3+m):(2+m+n), 1]) <- exp(pars[4])
+#     model$H[1,1,1] <- exp(pars[5])
+#     model
+#   }
+#   
+#   # Train - Si allena sui valori passati (quindi quei valori di train non nulli)
+#   fit <- fitSSM(mod, pars, updt)
+#   print(fit$optim.out)
+#   
+#   # Filtro di karman - Effetua le predizioni - kfs1$muhat contiene una serie storica predetta (anche i dati di train vengono predetti)
+#   kfs <- KFS(fit$model,
+#             smoothing = c("state", "signal", "disturbance"))
+#   
+#   # conversione muhat in serie storica
+#   muhat <- xts(as.matrix(kfs$muhat),
+#                 index(train))
+#   muhat <- as.xts(muhat)
+#   return(muhat)
+# }
+
+ucm_mod3 <- function(train, train_dummy) {
   arm144 <- 10
   arm1008 <- 1
   # Definizione del modello
   mod <- SSModel(V1~SSMtrend(2, list(NA, NA))+
                     SSMseasonal(144, NA, "trigonometric", harmonics = 1:arm144)+
-                    SSMseasonal(1008, NA, "trigonometric", harmonics = 1:arm1008),
-                  H=NA, # Covariance matrix or array of disturbance terms ε[t] of observation equation
-                  data=train)
+                    # SSMseasonal(1008, NA, "trigonometric", harmonics = 1:arm1008),
+                    train_dummy,
+                 H=NA, 
+                 data=train)
+
+  # Assegna i valori iniziali ai parametri, parte da 0.
+  mod$P1inf[] <- 0 # no componenti diffuse
+  mod$a1[1] <- mean(train[1:144]) # expected value of the initial state vector α[1]
   
-  mod$P1inf[] <- 0 # diffuse part of P[1] (p[1] is the covariance matrix of α[1])
-  mod$a1[1] <- mean(train[1:(144*3)]) # valore del livello iniziale (basata sulla media dei primi 3 giorni)
-  vy <- var(log(train[1:(144)])) # varianza serie storica ((utilizzata sotto per dare un ordine di grandezza))primo giorno)
-  diag(mod$P1) <- vy * 10 # specifichiamo che abbiamo molta incertezza sui valori che abbiamo specificato
+  vy <- var(train[1:144]) # varianza serie storica (utilizzata sotto per dare un ordine di grandezza)
+  diag(mod$P1) <- vy*10 # specifichiamo che abbiamo molta incertezza sui valori che abbiamo specificato
   
-  # definisco le varianze a partire da vy
+  #Inizializzazione delle varianze sulla base di vy
   pars <- log(c(
-    logVarEta = vy/100000,
-    logVarZeta = vy/1500,
-    logVarOm144 = vy/1,
-    logVarOm1008 = vy/10000,
-    logVarEps = vy/100
+    logVarEta = vy/10000,
+    logVarZeta = vy/100000,
+    logVarOm144 = vy/1000,
+    #logVarOm1008 = vy/100000,
+    logVarEps = vy/1000
   ))
   
-  # funzione di update -> imposto i valori iniziali
+  # funzione di update
   updt <- function(pars, model){
-    m <- arm144*2
-    n <- arm1008*2
-    model$Q[1,1,1] <- exp(pars[1])
-    model$Q[2,2,1] <- exp(pars[2])
-    diag(model$Q[3:(2+m), 3:(2+m), 1]) <- exp(pars[3])
-    diag(model$Q[(3+m):(2+m+n), (3+m):(2+m+n), 1]) <- exp(pars[4])
-    model$H[1,1,1] <- exp(pars[5])
+    model$Q[1,1,1] <- exp(pars[1]) # level
+    model$Q[2,2,1] <- exp(pars[2]) # slope
+    diag(model$Q[3:(2+arm144*2), 3:(2+arm144*2), 1]) <- exp(pars[3]) # seasonality 144
+    #diag(model$Q[(3+arm144*2):(2+arm144*2+arm1008*2), (3+arm144*2):(2+arm144*2+arm1008*2), 1]) <- exp(pars[4]) # seasonality 1008
+    model$H[1,1,1] <- exp(pars[4]) # H
     model
   }
   
@@ -624,7 +775,7 @@ ucm_mod3 <- function(train) {
   fit <- fitSSM(mod, pars, updt)
   print(fit$optim.out)
   
-  # Filtro di karman - Effetua le predizioni - kfs1$muhat contiene una serie storica predetta (anche i dati di train vengono predetti)
+  # Filtro di kalman - Effetua le predizioni - kfs1$muhat contiene una serie storica predetta (anche i dati di train vengono predetti)
   kfs <- KFS(fit$model,
             smoothing = c("state", "signal", "disturbance"))
   
@@ -637,7 +788,7 @@ ucm_mod3 <- function(train) {
 ```
 
 ```{r}
-ucm_pred3 <- ucm_mod3(train_ucm) # fare predizioni su 
+ucm_pred3 <- ucm_mod3(train_ucm, train_dummy_ucm)
 ```
 
 ```{r}
@@ -645,6 +796,196 @@ plot_pred(ucm_pred3)
 
 ucm_stats3 <- stats(data_xts[val_index:(val_index+144*npred-1)], ucm_pred3[(nrow(ucm_pred3)-144*npred+1):nrow(ucm_pred3)])
 stats_results[nrow(stats_results) + 1,] <- c("ucm_mod3", ucm_stats3)
+```
+
+#### Mod 4
+
+```{r}
+ucm_mod4 <- function(train) {
+  arm7 <- 10
+  # Definizione del modello
+  mod <- SSModel(V1~SSMtrend(2, list(NA, NA))+
+                    SSMseasonal(7, NA, "dummy"),
+                    # SSMseasonal(1008, NA, "trigonometric", harmonics = 1:arm1008),
+                    # train_dummy,
+                 H=NA, 
+                 data=train)
+
+  # Assegna i valori iniziali ai parametri, parte da 0.
+  mod$P1inf[] <- 0 # no componenti diffuse
+  mod$a1[1] <- mean(train[1:14]) # expected value of the initial state vector α[1]
+  
+  vy <- var(train[1:14]) # varianza serie storica (utilizzata sotto per dare un ordine di grandezza)
+  diag(mod$P1) <- vy*10 # specifichiamo che abbiamo molta incertezza sui valori che abbiamo specificato
+  
+  #Inizializzazione delle varianze sulla base di vy
+  pars <- log(c(
+    logVarEta = vy/10000,
+    logVarZeta = vy/100000,
+    logVarOm7 = vy/1000,
+    #logVarOm1008 = vy/100000,
+    logVarEps = vy/1000
+  ))
+  
+  # funzione di update
+  updt <- function(pars, model){
+    model$Q[1,1,1] <- exp(pars[1]) # level
+    model$Q[2,2,1] <- exp(pars[2]) # slope
+    diag(model$Q[3:(2+arm144*2), 3:(2+arm144*2), 1]) <- exp(pars[3]) # seasonality 144
+    #diag(model$Q[(3+arm144*2):(2+arm144*2+arm1008*2), (3+arm144*2):(2+arm144*2+arm1008*2), 1]) <- exp(pars[4]) # seasonality 1008
+    model$H[1,1,1] <- exp(pars[4]) # H
+    model
+  }
+  
+  # Train - Si allena sui valori passati (quindi quei valori di train non nulli)
+  fit <- fitSSM(mod, pars)
+  print(fit$optim.out)
+  
+  # Filtro di kalman - Effetua le predizioni - kfs1$muhat contiene una serie storica predetta (anche i dati di train vengono predetti)
+  kfs <- KFS(fit$model,
+            smoothing = c("state", "signal", "disturbance"))
+  
+  # conversione muhat in serie storica
+  muhat <- xts(as.matrix(kfs$muhat),
+                index(train))
+  muhat <- as.xts(muhat)
+  return(muhat)
+}
+```
+
+```{r}
+train_meanhour_ucm <- period.apply(train_ucm, endpoints(train_ucm, "hours"), mean)
+index(train_meanhour_ucm) <- index(train_meanhour_ucm)-600*2
+
+train_byhour_ucm <- vector('list', 24)
+for (hour in 1:24) {
+  train_byhour_ucm[[hour]] <- train_meanhour_ucm[seq(hour, length(train_meanhour_ucm), 24)]
+  }
+```
+
+```{r}
+val_meanhour_ucm <- period.apply(data_xts, endpoints(data_xts, "hours"), mean)
+index(val_meanhour_ucm) <- index(val_meanhour_ucm)-600*2
+
+val_byhour_ucm <- vector('list', 24)
+for (hour in 1:24) {
+  val_byhour_ucm[[hour]] <- val_meanhour_ucm[seq(hour, length(val_meanhour_ucm), 24)] # to obtain the index
+  }
+```
+
+```{r}
+ucm_mod4_byhour <- vector('list', 24)
+for (hour in 1:24) {
+  ucm_mod4_byhour[[hour]] <- ucm_mod4(train_byhour_ucm[[hour]])
+  }
+```
+
+```{r}
+ucm_pred4_byhour <- vector('list', 24)
+for (hour in 1:24) {
+  ucm_pred4_byhour[[hour]] <- forecast(ucm_mod4_byhour[[hour]], npred)
+  ucm_pred4_byhour[[hour]] <- xts(ucm_pred4_byhour[[hour]]$mean, index(val_byhour[[hour]]))
+}
+
+ucm_pred4_merged <- do.call(rbind, ucm_pred4_byhour) # concatenate the predictions
+```
+
+```{r}
+temp <- xts(rep(as.numeric(NA), length(val)), index(val))
+arima_pred5 <- merge(temp, arima_pred5_merged)$arima_pred5_merged
+arima_pred5 <- na.approx(arima_pred5, na.rm = FALSE)
+arima_pred5 <- na.locf(arima_pred5, na.rm = FALSE)
+arima_pred5 <- na.locf(arima_pred5, fromLast = TRUE)
+names(arima_pred5) <- "V1"
+```
+
+```{r}
+arima_stats5_byhour <- vector('list', 24)
+for (hour in 1:24) {
+  arima_stats5_byhour[[hour]] <- stats(arima_pred5_byhour[[hour]], val_byhour[[hour]])[[3]]
+}
+plot(unlist(arima_stats5_byhour), type='l', ylab = 'MAE', xlab = 'Hour')
+
+
+p <- ggplot(data = data.frame(x=1:24, y=unlist(arima_stats5_byhour)), aes(x=x, y=y)) +
+  geom_point() + 
+  geom_segment( aes(x=x, xend=x, y=0, yend=y)) + xlab('Hours') + ylab('MAE')
+p
+ggsave('plots/mae_perhour.jpg', p, height = 3 , width = 5)
+  
+```
+
+```{r}
+plot_pred(arima_pred5)
+stats_results[nrow(stats_results) + 1,] <- c("arima_mod5", stats(val, arima_pred5))
+```
+
+#### Mod 5
+
+```{r}
+ucm_mod5 <- function(train) {
+  arm144 <- 10
+  arm1008 <- 1
+  # Definizione del modello
+  mod <- SSModel(V1~SSMtrend(2, list(NA, NA))+
+                    SSMseasonal(144, NA, "trigonometric", harmonics = 1:arm144)+
+                    #SSMseasonal(1008, NA, "trigonometric", harmonics = 1:arm1008),
+                    SSMcycle(1008, NA),
+                  H=NA, 
+                  data=train)
+
+  # Assegna i valori iniziali ai parametri, parte da 0.
+  mod$P1inf[] <- 0 # no componenti diffuse
+  mod$a1[1] <- mean(train[1:144]) # expected value of the initial state vector α[1]
+  
+  vy <- var(train[1:144]) # varianza serie storica (utilizzata sotto per dare un ordine di grandezza)
+  diag(mod$P1) <- vy*10 # specifichiamo che abbiamo molta incertezza sui valori che abbiamo specificato
+  
+  #Inizializzazione delle varianze sulla base di vy
+  pars <- log(c(
+    logVarEta = vy/10000,
+    logVarZeta = vy/100000,
+    logVarOm144 = vy/1000,
+    logVarOm10 = vy/100000,
+    logVarEps = vy/1000
+  ))
+  
+  # funzione di update
+  updt <- function(pars, model){
+    model$Q[1,1,1] <- exp(pars[1]) # level
+    model$Q[2,2,1] <- exp(pars[2]) # slope
+    diag(model$Q[3:(2+arm144*2), 3:(2+arm144*2), 1]) <- exp(pars[3]) # seasonality 144
+    #diag(model$Q[(3+arm144*2):(2+arm144*2+arm1008*2), (3+arm144*2):(2+arm144*2+arm1008*2), 1]) <- exp(pars[4]) # seasonality 1008
+    model$Q[23:24, 23:24, 1] <- exp(pars[4])
+    model$H[1,1,1] <- exp(pars[5])
+    model
+  }
+  
+  # Train - Si allena sui valori passati (quindi quei valori di train non nulli)
+  fit <- fitSSM(mod, pars, updt)
+  print(fit$optim.out)
+  
+  # Filtro di karman - Effetua le predizioni - kfs1$muhat contiene una serie storica predetta (anche i dati di train vengono predetti)
+  kfs <- KFS(fit$model,
+             smoothing = c("state", "signal", "disturbance"))
+  
+  # conversione muhat in serie storica
+  muhat <- xts(as.matrix(kfs$muhat),
+                index(train))
+  muhat <- as.xts(muhat)
+  return(muhat)
+}
+```
+
+```{r}
+ucm_pred5 <- ucm_mod5(train_ucm)
+```
+
+```{r}
+plot_pred(ucm_pred5)
+
+ucm_stats5 <- stats(data_xts[val_index:(val_index+144*npred-1)], ucm_pred5[(nrow(ucm_pred5)-144*npred+1):nrow(ucm_pred5)])
+stats_results[nrow(stats_results) + 1,] <- c("ucm_mod5", ucm_stats5)
 ```
 
 ### Machine Learning
@@ -670,8 +1011,20 @@ ml_pred1 <- xts(ml_pred1$prediction, index(val))
 
 ```{r}
 plot_pred(ml_pred1)
-
 stats_results[nrow(stats_results) + 1,] <- c("ml_mod1", stats(val, ml_pred1))
+
+
+df_plot_pred <- merge.xts(ground_truth = data_xts[(val_index-144*4):nrow(data_xts),], pred = ml_pred1)
+df_plot_pred <- data.frame(df_plot_pred, date=index(df_plot_pred))
+
+p <- ggplot() + 
+  geom_line(data = df_plot_pred, aes(x = date, y = ground_truth)) +
+  geom_line(data = df_plot_pred, aes(x = date, y = pred), color = "#00BA38") +
+  geom_vline(xintercept=as.numeric(df_plot_pred$date[144*4]), linetype=2) +
+  xlab('Date') +
+  ylab('Power')
+p
+ggsave('plots/ml_pred.jpg', p, height = 2 , width = 6)
 ```
 
 #### Mod 2
@@ -694,6 +1047,97 @@ ml_pred2 <- xts(ml_pred2$prediction, index(val))
 ```{r}
 plot_pred(ml_pred2)
 stats_results[nrow(stats_results) + 1,] <- c("ml_mod2", stats(val, ml_pred2))
+```
+
+#### Mod 3
+
+```{r}
+num_lags <- 24*7
+
+# aggregate data by hour
+data_xts_agg <- period.apply(data_xts, endpoints(data_xts, "hours"), mean)
+index(data_xts_agg) <- index(data_xts_agg)-600*2
+
+wday <- wday(time(data_xts_agg), week_start = getOption("lubridate.week.start", 1)) # day of the week
+lags <- embed(data_xts_agg, (num_lags+1))[,-1]
+
+y_ml <- data_xts_agg[-(1:num_lags)]
+x_ml <- cbind(wday[-(1:num_lags)], lags)
+
+# split in train and val
+y_ml_train <- y_ml[1:as.integer(val_index/6-num_lags)]
+x_ml_train <- x_ml[1:as.integer(val_index/6-num_lags),]
+y_ml_val <- y_ml[as.integer(val_index/6-(num_lags-1)):nrow(y_ml)]
+x_ml_val <- x_ml[as.integer(val_index/6-(num_lags-1)):nrow(y_ml),]
+```
+
+```{r}
+# training
+ml_mod3 <- randomForest(x_ml_train, y_ml_train,
+                    ntree=200)
+
+# predictions
+ml_pred3 <- c()
+elem <- x_ml_val[1,] # first elem of val
+
+for (i in 1:nrow(y_ml_val)){
+  pr <- predict(ml_mod3, newdata = elem)
+  elem <- elem[-length(elem)] # remove last elem
+  elem <- append(elem, pr, after=1) # add new elem
+  ml_pred3 <- append(ml_pred3, pr)
+}
+
+ml_pred3 <- as.xts(ml_pred3, order.by = index(y_ml_val))
+
+# imputation
+temp <- xts(rep(as.numeric(NA), length(val)), index(val))
+ml_pred3 <- merge(temp, ml_pred3)$ml_pred3
+ml_pred3 <- na.approx(ml_pred3, na.rm = FALSE)
+ml_pred3 <- na.locf(ml_pred3, na.rm = FALSE)
+ml_pred3 <- na.locf(ml_pred3, fromLast = TRUE)
+names(ml_pred3) <- "V1"
+```
+
+```{r}
+plot_pred(ml_pred3)
+stats_results[nrow(stats_results) + 1,] <- c("ml_mod3", stats(val, ml_pred3))
+```
+
+implementation with ranger
+
+```{r}
+# oo <- data.frame(y_ml_train, x_ml_train)
+# ooo <- data.frame(y_ml_val, x_ml_val)
+# ml_mod3 <- ranger(formula = y_ml_train ~ .,
+#                     data = oo,
+#                     num.trees=100)
+```
+
+```{r}
+# # predictions
+# ml_pred3 <- c()
+# elem <- ooo[1,-1] # first elem of val
+# 
+# for (i in 1:nrow(y_ml_val)){
+#   pr <- predict(ml_mod3, data = elem)$predictions
+#   elem <- elem[,-length(elem)] # remove last elem
+#   add_column(elem, d = pr, .after = 1)
+#   #elem <- append(elem, pr, after=3) # add new elem
+#   ml_pred3 <- append(ml_pred3, pr)
+# }
+# # giusto in giu
+# ml_pred3 <- as.xts(ml_pred3, order.by = index(y_ml_val))
+# 
+# temp <- xts(rep(as.numeric(NA), length(val)), index(val))
+# 
+# ml_pred3 <- merge(temp, ml_pred3)$ml_pred3
+# ml_pred3 <- na.approx(ml_pred3, na.rm = FALSE)
+# ml_pred3 <- na.locf(ml_pred3, na.rm = FALSE)
+# ml_pred3 <- na.locf(ml_pred3, fromLast = TRUE)
+# names(ml_pred3) <- "V1"
+# 
+# stats(val, ml_pred3)
+# plot_pred(ml_pred3)
 ```
 
 ## 3. Data prediction
@@ -727,7 +1171,7 @@ stats_results
 dic_arima_train <- arima_mod4(train_gen_nov, train_gen_nov_dummy)
 
 dic_arima_pred <- forecast(dic_arima_train, 144*npred, xreg=test_gen_nov_dummy)
-dic_arima_pred <- xts(dic_arima_pred$mean, index(val))
+dic_arima_pred <- xts(dic_arima_pred$mean, index(test))
 ```
 
 #### UCM
@@ -756,17 +1200,29 @@ results <- data.frame(date = index(test),
 ```
 
 ```{r}
-df <- gather(results, Model, Values, ARIMA:ML)
+sum(results$ARIMA)
+sum(results$UCM)
+sum(results$ML)
+```
+
+```{r}
+df_plot_pred <- merge.xts(Actual = data_xts_complete[(test_index-144*4):nrow(data_xts_complete),], ARIMA = dic_arima_pred)
+df_plot_pred <- merge.xts(df_plot_pred, UCM = dic_ucm_pred)
+df_plot_pred <- merge.xts(df_plot_pred, SVM = dic_ml_pred)
+
+df_plot_pred <- data.frame(df_plot_pred, date=index(df_plot_pred))
+df <- gather(df_plot_pred, Model, Values, Actual:SVM)
 
 p <- ggplot(data = df, aes(x=date, y=Values)) +
   geom_line(aes(color = Model), size = 0.5) +
-  theme_minimal() +
-  labs(x = NULL, y = "Power", title = "December forecasts comparison")
+  labs(y = "Power", x = '') + 
+  scale_color_manual(values=c("black", "#F8766D", "#00BA38", "#619CFF")) +
+  geom_vline(xintercept=as.numeric(df_plot_pred$date[144*4]), linetype=2)
 p
 
 ggsave('plots/december_forecasts_comparison.jpg', p, height = 3 , width = 3 * 4)
 ```
 
 ```{r}
-write.csv(results, "886725_20230205.csv", row.names=FALSE) # cambiare data
+write.csv(results, "886725_20230208.csv", row.names=FALSE) # cambiare data
 ```
